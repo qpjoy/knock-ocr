@@ -479,13 +479,22 @@ wait_ready() {
     pool_ready="$(grep -o '"ready": *[0-9]\+' <<<"$info" | head -1 | grep -o '[0-9]\+' || true)"
     pool_ready="${pool_ready:-0}"
 
-    if [ "$vllm_up" = yes ] && [ "$pool_ready" -gt 0 ]; then
+    # 就绪判据只看 pool：pool>0 说明引擎实例真的构造成功了，那才是真正的就绪信号。
+    # vllm 探活只是参考，探活假阴性（比如 warmup 占着 GIL 把探测饿死）不该卡死整个 deploy。
+    if [ "$pool_ready" -gt 0 ]; then
       printf '\r\033[K'; ok "服务就绪（用时 ${elapsed}s）"; return 0
     fi
 
     # 跟随「当前还没好的那个」的日志，别再一直盯着已经空闲的 vLLM
-    if [ "$vllm_up" = no ]; then watch="$C_VLLM"; stage="① vLLM 启动中"
-    else watch="$C_API"; stage="② API 构建流水线"; fi
+    # 只要 API 容器已经开始打 [pool] 日志，就跟随它 —— 那是真正决定就绪的一环。
+    # 否则才盯 vLLM。避免 vllm 探活假阴性时，永远看不到 API 侧的真实报错。
+    if docker logs "$C_API" 2>&1 | grep -q "^.pool."; then
+      watch="$C_API"; stage="② 构建流水线"
+    elif [ "$vllm_up" = no ]; then
+      watch="$C_VLLM"; stage="① vLLM 启动中"
+    else
+      watch="$C_API"; stage="② 构建流水线"
+    fi
     line="$(last_log_line "$watch")"
     if [ "$line" = "$prev" ]; then stuck=$((stuck + 3)); else stuck=0; prev="$line"; fi
 
