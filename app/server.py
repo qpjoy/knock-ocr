@@ -50,6 +50,8 @@ def _normalize_vllm_url(url: str) -> str:
 
 
 VLLM_URL = _normalize_vllm_url(os.environ.get("OCR_VLLM_URL", "http://127.0.0.1:8118"))
+# VLLM_URL 已经以 /v1 结尾，探活地址只需再接 /models，别重复拼 /v1
+MODELS_URL = VLLM_URL + "/models"
 WORKERS = int(os.environ.get("OCR_WORKERS", "4"))
 MAX_MB = int(os.environ.get("OCR_MAX_MB", "50"))
 # 单请求排队等流水线的上限；超时直接 503，避免请求堆积拖垮服务
@@ -293,11 +295,11 @@ def healthz():
 
 @app.get("/api/info")
 def info():
-    backend = {"url": VLLM_URL, "reachable": False, "models": []}
+    backend = {"url": VLLM_URL, "probe": MODELS_URL, "reachable": False, "models": []}
     try:
         import urllib.request
 
-        with urllib.request.urlopen(f"{VLLM_URL}/v1/models", timeout=3) as r:
+        with urllib.request.urlopen(MODELS_URL, timeout=3) as r:
             data = json.loads(r.read().decode())
             backend["reachable"] = True
             backend["models"] = [m.get("id") for m in data.get("data", [])]
