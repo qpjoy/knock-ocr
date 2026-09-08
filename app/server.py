@@ -67,6 +67,19 @@ MAX_PIXELS = _num_env("OCR_MAX_PIXELS")
 # 单块生成 token 上限，防止个别块跑飞把整页拖死
 MAX_NEW_TOKENS = _num_env("OCR_MAX_NEW_TOKENS")
 LAYOUT_THRESHOLD = _num_env("OCR_LAYOUT_THRESHOLD", float)
+
+# 运行时可调的一组值。分两类：
+#   per-request  layout_threshold / max_pixels / max_new_tokens —— 每次 predict 时传，立即生效
+#   构造期       vl_rec_max_concurrency —— 建流水线时定死，改它要重建池子
+TUNING = {
+    "vl_rec_max_concurrency": VL_CONCURRENCY,
+    "max_pixels": MAX_PIXELS,
+    "max_new_tokens": MAX_NEW_TOKENS,
+    "layout_threshold": LAYOUT_THRESHOLD,
+}
+
+# predict() 不认的参数记下来，后续不再重复尝试
+_BAD_PREDICT_KEYS: set = set()
 # VLLM_URL 已经以 /v1 结尾，探活地址只需再接 /models，别重复拼 /v1
 MODELS_URL = VLLM_URL + "/models"
 WORKERS = int(os.environ.get("OCR_WORKERS", "4"))
@@ -149,6 +162,7 @@ class PipelinePool:
         self._q: "queue.Queue" = queue.Queue()
         self.ready = 0
         self.error: str | None = None
+        self.rebuilding = False
         self._lock = threading.Lock()
 
     def _build(self):
@@ -164,15 +178,7 @@ class PipelinePool:
 
         # 性能参数按版本可能不被接受，单独放一组，被拒就逐个丢掉重试，
         # 保证换镜像版本时不会因为一个未知参数把整个服务起不来。
-        tuning = {}
-        if VL_CONCURRENCY:
-            tuning["vl_rec_max_concurrency"] = VL_CONCURRENCY
-        if MAX_PIXELS:
-            tuning["max_pixels"] = MAX_PIXELS
-        if MAX_NEW_TOKENS:
-            tuning["max_new_tokens"] = MAX_NEW_TOKENS
-        if LAYOUT_THRESHOLD:
-            tuning["layout_threshold"] = LAYOUT_THRESHOLD
+        tuning = {k: v for k, v in TUNING.items() if v}
 
         while True:
             try:
@@ -217,6 +223,40 @@ class PipelinePool:
     @property
     def idle(self) -> int:
         return self._q.qsize()
+
+    def rebuild_async(self, note: str = ""):
+        """后台重建整池。构造期参数（如并发数）改动后调用。
+
+        先把新实例全部建好再原子替换队列，重建期间老实例继续服务，不中断。
+        """
+        if self.rebuilding:
+            return False
+        self.rebuilding = True
+
+        def run():
+            try:
+                print("[pool] 重建流水线（" + note + "）…", flush=True)
+                fresh = []
+                for i in range(self.size):
+                    fresh.append(self._build())
+                    print("[pool] 重建 %d/%d" % (i + 1, self.size), flush=True)
+                nq: "queue.Queue" = queue.Queue()
+                for x in fresh:
+                    nq.put(x)
+                with self._lock:
+                    self._q = nq          # 原子替换，老队列里的实例交给 GC
+                    self.ready = len(fresh)
+                    self.error = None
+                print("[pool] 重建完成，%d 条就绪" % self.ready, flush=True)
+            except Exception:
+                self.error = traceback.format_exc(limit=6)
+                print("[pool] 重建失败:", flush=True)
+                print(self.error, flush=True)
+            finally:
+                self.rebuilding = False
+
+        threading.Thread(target=run, daemon=True, name="pool-rebuild").start()
+        return True
 
 
 POOL = PipelinePool(WORKERS)
@@ -290,8 +330,25 @@ def _json_of(res) -> dict:
     return {}
 
 
-def _run(pipeline, path: str, merge_tables: bool) -> tuple[str, list, int]:
-    pages = list(pipeline.predict(path))
+def _predict(pipeline, path: str, overrides: dict):
+    """带逐请求参数调用 predict；本版本不认的参数自动丢掉并记住。"""
+    kw = {k: v for k, v in (overrides or {}).items()
+          if v is not None and k not in _BAD_PREDICT_KEYS}
+    while True:
+        try:
+            return list(pipeline.predict(path, **kw))
+        except TypeError as e:
+            bad = next((k for k in kw if k in str(e)), None)
+            if not bad:
+                raise
+            _BAD_PREDICT_KEYS.add(bad)
+            kw.pop(bad)
+            print("[warn] predict 不支持参数 " + bad + "，已忽略（改由构造期设置）", flush=True)
+
+
+def _run(pipeline, path: str, merge_tables: bool,
+         overrides: dict | None = None) -> tuple[str, list, int]:
+    pages = _predict(pipeline, path, overrides)
 
     # 多页 PDF 走官方重组，跨页表格能接起来
     if len(pages) > 1 and hasattr(pipeline, "restructure_pages"):
@@ -348,12 +405,9 @@ def info():
         "model": MODEL,
         "benchmark": "OmniDocBench v1.6 96.3%",
         "layout_device": DEVICE,
-        "tuning": {
-            "vl_rec_max_concurrency": VL_CONCURRENCY,
-            "max_pixels": MAX_PIXELS,
-            "max_new_tokens": MAX_NEW_TOKENS,
-            "layout_threshold": LAYOUT_THRESHOLD,
-        },
+        "tuning": dict(TUNING),
+        "unsupported_predict_keys": sorted(_BAD_PREDICT_KEYS),
+        "rebuilding": POOL.rebuilding,
         "vl_backend": VL_BACKEND,
         "vlm_backend": backend,
         "workers": WORKERS,
@@ -372,6 +426,12 @@ async def ocr(
     request: Request,
     merge_tables: bool = Query(True, description="多页 PDF 是否合并跨页表格"),
     include_json: bool = Query(True, description="是否返回结构化结果"),
+    layout_threshold: float | None = Query(None, ge=0.05, le=0.95,
+                                           description="版面检测阈值，高=块更少更快"),
+    max_pixels: int | None = Query(None, ge=100000, le=20000000,
+                                   description="送进 VLM 的像素上限"),
+    max_new_tokens: int | None = Query(None, ge=64, le=8192,
+                                       description="单块生成 token 上限"),
 ):
     rid = uuid.uuid4().hex[:12]
     t_start = time.perf_counter()
@@ -403,6 +463,14 @@ async def ocr(
     ok = False
     tmp = None
     timings = {"receive_ms": round((t_body - t_start) * 1000, 1)}
+    # 逐请求覆盖；没传的回落到全局 TUNING
+    overrides = {
+        "layout_threshold": layout_threshold if layout_threshold is not None
+                            else TUNING.get("layout_threshold"),
+        "max_pixels": max_pixels if max_pixels is not None else TUNING.get("max_pixels"),
+        "max_new_tokens": max_new_tokens if max_new_tokens is not None
+                          else TUNING.get("max_new_tokens"),
+    }
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
             fh.write(blob)
@@ -413,7 +481,7 @@ async def ocr(
             q0 = time.perf_counter()
             with POOL.acquire(ACQUIRE_TIMEOUT) as pipeline:
                 q1 = time.perf_counter()
-                out = _run(pipeline, tmp, merge_tables)
+                out = _run(pipeline, tmp, merge_tables, overrides)
                 timings["queue_ms"] = round((q1 - q0) * 1000, 1)
                 timings["infer_ms"] = round((time.perf_counter() - q1) * 1000, 1)
                 return out
@@ -428,6 +496,8 @@ async def ocr(
             "pages": npages,
             "elapsed_ms": timings["total_ms"],
             "timings": timings,
+            "applied": {k: v for k, v in overrides.items()
+                        if v is not None and k not in _BAD_PREDICT_KEYS},
             "markdown": md,
         }
         if include_json:
@@ -447,6 +517,65 @@ async def ocr(
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+@app.post("/api/config")
+async def set_config(request: Request):
+    """在线调参。
+
+    per-request 的三个参数只改默认值，立即生效；
+    vl_rec_max_concurrency 是构造期参数，改了要重建流水线池 —— 后台重建，
+    期间老实例继续服务，不中断。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "请求体必须是 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是 JSON 对象")
+
+    limits = {
+        "vl_rec_max_concurrency": (1, 64, int),
+        "max_pixels": (100000, 20000000, int),
+        "max_new_tokens": (64, 8192, int),
+        "layout_threshold": (0.05, 0.95, float),
+    }
+    changed, needs_rebuild = {}, False
+    for k, v in body.items():
+        if k not in limits:
+            raise HTTPException(400, "未知参数 %s，可选：%s" % (k, sorted(limits)))
+        lo, hi, cast = limits[k]
+        if v in (None, "", 0):
+            val = None                      # 显式清空 = 恢复不限制
+        else:
+            try:
+                val = cast(v)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "%s 不是合法数值：%r" % (k, v))
+            if not (lo <= val <= hi):
+                raise HTTPException(400, "%s 超出范围 [%s, %s]" % (k, lo, hi))
+        if TUNING.get(k) != val:
+            TUNING[k] = val
+            changed[k] = val
+            if k == "vl_rec_max_concurrency":
+                needs_rebuild = True
+
+    started = False
+    if needs_rebuild:
+        started = POOL.rebuild_async(
+            "并发数改为 %s" % TUNING["vl_rec_max_concurrency"])
+    if started:
+        note = "并发数已改，正在后台重建流水线；重建期间沿用旧实例，不中断服务。"
+    elif needs_rebuild:
+        note = "上一次重建还没结束，稍后再试。"
+    else:
+        note = "已生效，下一次识别即采用新参数。"
+    return {
+        "changed": changed,
+        "tuning": dict(TUNING),
+        "rebuilding": POOL.rebuilding,
+        "note": note,
+    }
 
 
 @app.get("/")
