@@ -23,6 +23,7 @@ VLLM_ARGS="${VLLM_ARGS:-}"               # 透传给 genai_server 的额外参�
 PROXY="${PROXY:-}"                       # 出网代理，如 http://127.0.0.1:7788（下模型权重要用）
 HOST_NET="${HOST_NET:-0}"                # =1 让 vLLM 走宿主机网络（代理只监听 127.0.0.1 时必须开）
 MODEL_SOURCE="${MODEL_SOURCE:-modelscope}" # 模型源 modelscope|aistudio|bos|huggingface；前三个境内直连可达
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"  # 仅镜像缺依赖时才用到
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-240}"    # GPU 探测单项超时，防止 import 卡死把 deploy 拖住
 
 REGISTRY="${REGISTRY:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle}"
@@ -303,7 +304,7 @@ cmd_pull() {
 }
 
 cmd_build() {
-  say "构建 API 镜像（这一层不需要联网）"
+  say "构建 API 镜像（依赖齐全时不需要联网）"
   # 同样要覆盖 docker 从 config.json 注入的构建期代理，否则 RUN 一旦联网就挂
   local net=(--build-arg "http_proxy=" --build-arg "https_proxy="
              --build-arg "HTTP_PROXY=" --build-arg "HTTPS_PROXY=")
@@ -313,6 +314,7 @@ cmd_build() {
          --build-arg "HTTP_PROXY=$PROXY"  --build-arg "HTTPS_PROXY=$PROXY")
   fi
   docker build "${net[@]}" --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+    --build-arg "PIP_INDEX_URL=$PIP_INDEX_URL" \
     -f docker/api.Dockerfile -t "$API_IMAGE" .
   ok "API 镜像就绪：$API_IMAGE"
 }
@@ -745,10 +747,30 @@ except Exception as e:
   dim "  把以上完整输出贴出来即可定位问题"
 }
 
-# 绕开本项目的 API 层，直接用官方 CLI 在 vLLM 容器内部跑一次完整识别。
-# 目的：把「模型能不能在这台机器上跑」和「我的 API 封装有没有 bug」彻底分开。
+# 绕开本项目的 API 层，用官方 CLI 跑一次完整识别。
+# 注意流水线要跑在 paddleocr-vl 镜像里（含 paddlex[ocr] 依赖），
+# genai-vllm-server 镜像只负责 VLM 推理服务，不含解析流水线。
 cmd_selftest() {
   [ "$(container_state "$C_VLLM")" = "running" ] || die "$C_VLLM 没在跑，先 deploy"
+
+  rule
+  say "0  检查 API 镜像里的解析流水线依赖"
+  local dep_out dep_rc=0
+  dep_out="$(docker run --rm "$API_IMAGE" python -c "
+from paddlex.utils.deps import require_extra
+require_extra('ocr')
+print('paddlex[ocr] 依赖齐全')
+" 2>&1)" || dep_rc=$?
+  if [ $dep_rc -eq 0 ]; then
+    ok "$dep_out"
+  else
+    warn "API 镜像缺少解析流水线依赖 —— 这就是 pool=0/4 的原因"
+    sed 's/^/      /' <<<"$dep_out" | tail -6
+    dim "      Dockerfile 已内置按需安装，重建镜像即可：bash scripts/manage.sh reset"
+    dim "      若安装步骤本身失败，看构建输出（多半是 pip 出不去网）"
+    rule
+    return 1
+  fi
 
   local f="${1:-}"
   mkdir -p "$STATE"
@@ -760,28 +782,21 @@ cmd_selftest() {
   fi
   [ -f "$f" ] || die "文件不存在：$f"
 
-  say "把文件拷进 vLLM 容器"
-  docker cp "$f" "$C_VLLM:/tmp/selftest_input"
-
-  rule
-  say "用官方 CLI 直接识别（完全不经过本项目的 API 层）"
-  dim "  paddleocr doc_parser --vl_rec_backend vllm-server --vl_rec_server_url http://127.0.0.1:$VLLM_PORT/v1"
+  echo; say "1  用官方 CLI 直接识别（临时容器，不经过本项目 API 层）"
+  dim "  镜像 $API_IMAGE，网络 $NET，后端 http://$C_VLLM:$VLLM_PORT/v1"
   echo
-  docker exec "$C_VLLM" bash -lc "
-    cd /tmp && rm -rf selftest_out && mkdir -p selftest_out
-    paddleocr doc_parser --input /tmp/selftest_input --save_path /tmp/selftest_out \
-      --vl_rec_backend vllm-server \
-      --vl_rec_server_url http://127.0.0.1:$VLLM_PORT/v1 \
-      --device cpu 2>&1 | tail -40
-    echo '--- 产出文件 ---'
-    find /tmp/selftest_out -type f | head -20
-    echo '--- markdown 前 1500 字 ---'
-    find /tmp/selftest_out -name '*.md' -exec head -c 1500 {} \; 2>/dev/null
-  " || true
+  local px=(); mapfile -t px < <(proxy_run_args)
+  docker run --rm --network "$NET" "${px[@]}"     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE"     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True     -v "$V_MODELS":/root/.paddlex     -v "$V_MS":/root/.cache/modelscope     -v "$(cd "$(dirname "$f")" && pwd)":/in:ro     "$API_IMAGE" bash -lc "
+      paddleocr doc_parser --input /in/$(basename "$f") --save_path /tmp/out         --vl_rec_backend vllm-server         --vl_rec_server_url http://$C_VLLM:$VLLM_PORT/v1         --device cpu 2>&1 | tail -40
+      echo '--- 产出 ---'
+      find /tmp/out -type f 2>/dev/null | head -20
+      echo '--- markdown 前 1500 字 ---'
+      find /tmp/out -name '*.md' -exec head -c 1500 {} \; 2>/dev/null
+    " || true
   rule
   say "怎么判断"
-  dim "  出现识别文本 → 模型在这台机器上完全可用，剩下的是本项目 API 层的问题"
-  dim "  这里就报错   → 是模型/服务端问题，把报错贴出来"
+  dim "  出现识别文本 → 模型在这台机器上完全可用，剩下是本项目 API 层的问题"
+  dim "  这里就报错   → 把报错贴出来"
 }
 
 cmd_server_help() {
