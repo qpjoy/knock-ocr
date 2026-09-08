@@ -35,6 +35,7 @@ C_VLLM="${PROJECT}-vllm"
 C_API="${PROJECT}-api"
 V_MODELS="${PROJECT}-models"
 V_HF="${PROJECT}-hf"
+V_MS="${PROJECT}-modelscope"
 STATE="$ROOT/.deploy"
 
 # ---------------------------------------------------------------- 输出
@@ -277,6 +278,7 @@ ensure_net() {
   docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
   docker volume inspect "$V_MODELS" >/dev/null 2>&1 || docker volume create "$V_MODELS" >/dev/null
   docker volume inspect "$V_HF"     >/dev/null 2>&1 || docker volume create "$V_HF" >/dev/null
+  docker volume inspect "$V_MS"     >/dev/null 2>&1 || docker volume create "$V_MS" >/dev/null
 }
 
 cmd_pull() {
@@ -323,6 +325,7 @@ start_vllm() {
     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     -v "$V_MODELS":/root/.paddlex \
     -v "$V_HF":/root/.cache/huggingface \
+    -v "$V_MS":/root/.cache/modelscope \
     "$VLLM_IMAGE" \
     paddleocr genai_server --model_name "$MODEL" \
       --host 0.0.0.0 --port "$VLLM_PORT" --backend vllm $VLLM_ARGS >/dev/null
@@ -350,6 +353,7 @@ start_api() {
     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE" \
     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     -v "$V_MODELS":/root/.paddlex \
+    -v "$V_MS":/root/.cache/modelscope \
     "$API_IMAGE" >/dev/null
   ok "容器 $C_API 已启动"
 }
@@ -600,7 +604,7 @@ cmd_disk() {
   say "镜像（拉过就不再拉，除非手动删）"
   docker images --format '  {{.Size}}\t{{.Repository}}:{{.Tag}}' | grep -E "paddleocr|$PROJECT" || dim "  （还没拉）"
   say "模型缓存卷（down/reset 都不会删）"
-  for v in "$V_MODELS" "$V_HF"; do
+  for v in "$V_MODELS" "$V_HF" "$V_MS"; do
     if docker volume inspect "$v" >/dev/null 2>&1; then
       local mp sz; mp="$(docker volume inspect -f '{{.Mountpoint}}' "$v")"
       sz="$(du -sh "$mp" 2>/dev/null | cut -f1)"
@@ -613,7 +617,7 @@ cmd_disk() {
   df -h /var/lib/docker 2>/dev/null | sed 's/^/  /'
   echo
   dim "  彻底删干净（下次要重下）："
-  dim "    docker volume rm $V_MODELS $V_HF"
+  dim "    docker volume rm $V_MODELS $V_HF $V_MS"
   dim "    docker image rm $VLLM_IMAGE $BASE_IMAGE"
   dim "  ⚠ 不要用 docker system prune -a，会把上面全清掉"
 }
@@ -686,6 +690,46 @@ for name, url in HOSTS:
   dim "  可选 bos|modelscope|aistudio|huggingface，前三个都在国内"
 }
 
+# 一次抓全所有诊断信息，不用来回问
+cmd_doctor() {
+  rule
+  say "1  容器状态"
+  for c in "$C_VLLM" "$C_API"; do
+    printf '    %-20s %s (exit=%s)\n' "$c" "$(container_state "$c")" "$(container_exit_code "$c")"
+  done
+
+  echo; say "2  API 侧流水线构建日志（[pool] 开头的行）"
+  docker logs "$C_API" 2>&1 | grep -E '^\[pool\]|Traceback|Error|error' | tail -40 \
+    | sed 's/^/    /' || true
+  docker logs "$C_API" 2>&1 | grep -q '^\[pool\]' || \
+    warn "    没有任何 [pool] 日志 —— 说明跑的是旧镜像，先 bash scripts/manage.sh reset"
+
+  echo; say "3  API 容器能否连到 vLLM"
+  docker exec "$C_API" python -c "
+import os, urllib.request
+u = os.environ.get('OCR_VLLM_URL', '?').rstrip('/')
+u = u if u.endswith('/v1') else u + '/v1'
+print('OCR_VLLM_URL =', os.environ.get('OCR_VLLM_URL'))
+print('probe        =', u + '/models')
+for k in ('http_proxy','https_proxy','no_proxy'):
+    print('%-13s=' % k, repr(os.environ.get(k)))
+try:
+    r = urllib.request.urlopen(u + '/models', timeout=5)
+    print('RESULT: 通  HTTP', r.status, r.read().decode()[:200])
+except Exception as e:
+    print('RESULT: 不通 ->', type(e).__name__, str(e)[:200])
+" 2>&1 | sed 's/^/    /' || warn "    exec 失败，容器可能没在跑"
+
+  echo; say "4  vLLM 最后 15 行"
+  docker logs "$C_VLLM" 2>&1 | tail -15 | sed 's/^/    /' || true
+
+  echo; say "5  /api/info"
+  curl -fsS -m 5 "http://127.0.0.1:$PORT/api/info" 2>/dev/null | sed 's/^/    /' || \
+    warn "    取不到，API 没起来？"
+  echo; rule
+  dim "  把以上完整输出贴出来即可定位问题"
+}
+
 cmd_server_help() {
   say "genai_server 真实可用参数（用于 MODEL / VLLM_ARGS）"
   docker run --rm "$VLLM_IMAGE" paddleocr genai_server --help
@@ -698,7 +742,7 @@ cmd_clean() {
   docker image rm "$API_IMAGE" >/dev/null 2>&1 || true
   rm -rf "$STATE"
   ok "已清理"
-  dim "  模型缓存卷保留（重装免下载）：docker volume rm $V_MODELS $V_HF"
+  dim "  模型缓存卷保留（重装免下载）：docker volume rm $V_MODELS $V_HF $V_MS"
   dim "  官方基础镜像保留：docker image rm $VLLM_IMAGE $BASE_IMAGE"
 }
 
@@ -717,6 +761,7 @@ knock-ocr demo
   logs [api|vllm]
   test [文件]   端到端识别一次（不传文件则自动造一张）
   bench         并发压测，看 QPS / P50 / P95
+  doctor        一次抓全所有诊断信息（卡住/报错时先跑这个）
   netcheck      在容器里测能不能连上模型源（连不上模型时先跑这个）
   disk          镜像与模型缓存占了多少盘
   server-help   查看 genai_server 支持哪些参数（模型名对不对看这个）
@@ -757,6 +802,7 @@ case "${1:-deploy}" in
   pull)    shift; cmd_pull "$@" ;;
   build)   shift; cmd_build "$@" ;;
   preflight) shift; cmd_preflight "$@" ;;
+  doctor)  shift; cmd_doctor "$@" ;;
   netcheck) shift; cmd_netcheck "$@" ;;
   server-help) shift; cmd_server_help "$@" ;;
   clean)   shift; cmd_clean "$@" ;;

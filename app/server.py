@@ -331,6 +331,13 @@ async def ocr(
 ):
     rid = uuid.uuid4().hex[:12]
 
+    # 池子没就绪就立刻拒绝，别让请求傻等 ACQUIRE_TIMEOUT 秒把界面挂住
+    if POOL.ready == 0:
+        detail = f"服务尚未就绪（流水线 0/{POOL.size}）。"
+        detail += ("构建流水线时报错了，用 `manage.sh logs api` 看栈。"
+                   if POOL.error else "仍在初始化，请稍候；进度看 `manage.sh logs api`。")
+        raise HTTPException(503, detail)
+
     raw = await request.body()
     if not raw:
         raise HTTPException(400, "空请求体")
