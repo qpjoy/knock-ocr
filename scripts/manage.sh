@@ -21,6 +21,8 @@ DEVICE="${DEVICE:-auto}"                 # auto | cpu | gpu:0  —— Paddle 侧
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-2400}"     # 等服务就绪的秒数（首次要下模型，给足）
 VLLM_ARGS="${VLLM_ARGS:-}"               # 透传给 genai_server 的额外参数
 PROXY="${PROXY:-}"                       # 出网代理，如 http://127.0.0.1:7788（下模型权重要用）
+HOST_NET="${HOST_NET:-0}"                # =1 让 vLLM 走宿主机网络（代理只监听 127.0.0.1 时必须开）
+MODEL_SOURCE="${MODEL_SOURCE:-bos}"      # 模型源 bos|modelscope|aistudio|huggingface，国内优先 bos
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-240}"    # GPU 探测单项超时，防止 import 卡死把 deploy 拖住
 
 REGISTRY="${REGISTRY:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle}"
@@ -256,34 +258,52 @@ cmd_build() {
 
 start_vllm() {
   docker rm -f "$C_VLLM" >/dev/null 2>&1 || true
-  say "启动 VLM 推理服务（GPU $GPU_ID, model=$MODEL）"
+  local net=(--network "$NET")
+  if [ "$HOST_NET" = "1" ]; then
+    # 代理只监听 127.0.0.1 时，容器必须共享宿主机网络才连得上
+    net=(--network host)
+    say "启动 VLM 推理服务（GPU $GPU_ID, model=$MODEL, 宿主机网络）"
+  else
+    say "启动 VLM 推理服务（GPU $GPU_ID, model=$MODEL）"
+  fi
   local px=(); mapfile -t px < <(proxy_run_args)
   # shellcheck disable=SC2086
-  docker run -d --name "$C_VLLM" --network "$NET" \
+  docker run -d --name "$C_VLLM" "${net[@]}" \
     --gpus "device=$GPU_ID" \
     --restart unless-stopped \
     --shm-size 8g \
     "${px[@]}" \
     -e VLLM_FLASH_ATTN_VERSION=2 \
+    -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE" \
+    -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     -v "$V_MODELS":/root/.paddlex \
     -v "$V_HF":/root/.cache/huggingface \
     "$VLLM_IMAGE" \
     paddleocr genai_server --model_name "$MODEL" \
       --host 0.0.0.0 --port "$VLLM_PORT" --backend vllm $VLLM_ARGS >/dev/null
-  ok "容器 $C_VLLM 已启动"
+  ok "容器 $C_VLLM 已启动（模型源 $MODEL_SOURCE，已跳过连通性预检）"
 }
 
 start_api() {
   local dev="$1"
   docker rm -f "$C_API" >/dev/null 2>&1 || true
   say "启动 API + Web 服务（版面分析设备：$dev）"
+  # vLLM 若在宿主机网络，容器名解析不到，改用 host-gateway
+  local vurl="http://$C_VLLM:$VLLM_PORT" extra=()
+  if [ "$HOST_NET" = "1" ]; then
+    vurl="http://host.docker.internal:$VLLM_PORT"
+    extra=(--add-host "host.docker.internal:host-gateway")
+  fi
   docker run -d --name "$C_API" --network "$NET" \
     --restart unless-stopped \
     -p "$BIND:$PORT:8000" \
+    "${extra[@]}" \
     -e "OCR_DEVICE=$dev" \
     -e "OCR_MODEL=$MODEL" \
-    -e "OCR_VLLM_URL=http://$C_VLLM:$VLLM_PORT" \
+    -e "OCR_VLLM_URL=$vurl" \
     -e "OCR_WORKERS=$WORKERS" \
+    -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE" \
+    -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     -v "$V_MODELS":/root/.paddlex \
     "$API_IMAGE" >/dev/null
   ok "容器 $C_API 已启动"
@@ -308,6 +328,15 @@ diagnose() {
     warn "GPU 架构不匹配：镜像里的 PyTorch/vLLM 不支持 sm_120（Blackwell）"
     dim "      先跑 bash scripts/manage.sh gpucheck 确认"
     dim "      若确认不支持，需要换支持 Blackwell 的镜像或自行升级 vLLM"
+  fi
+  if grep -qiE 'no model hoster|no available model hosting|could not prepare the official model' <<<"$logs"; then
+    hit=1
+    warn "连不上模型源，权重下不下来（HuggingFace / ModelScope / AIStudio / BOS 全部不可达）"
+    dim "      先查清容器到底能不能出网：bash scripts/manage.sh netcheck"
+    dim "      最常见原因：代理只监听 127.0.0.1，桥接网络里的容器够不着 → 加 HOST_NET=1"
+    dim "        HOST_NET=1 PROXY=$PROXY bash scripts/manage.sh deploy"
+    dim "      国内机器优先试 BOS 直连（百度自家 CDN，往往不需要代理）："
+    dim "        MODEL_SOURCE=bos bash scripts/manage.sh deploy"
   fi
   if grep -qiE 'proxyerror|max retries|connection refused|connection reset|timed out|temporary failure in name resolution' <<<"$logs"; then
     hit=1
@@ -523,6 +552,55 @@ cmd_disk() {
   dim "  ⚠ 不要用 docker system prune -a，会把上面全清掉"
 }
 
+# 在「容器里」测网络 —— 宿主机能通不代表容器能通，这才是决定性的检查
+cmd_netcheck() {
+  local probe='
+import os, socket, urllib.request, ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+HOSTS = [
+    ("bos        ", "https://paddle-model-ecology.bj.bcebos.com"),
+    ("modelscope ", "https://modelscope.cn"),
+    ("aistudio   ", "https://aistudio.baidu.com"),
+    ("huggingface", "https://huggingface.co"),
+]
+px = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY") or ""
+print("proxy env :", px or "(未设置)")
+if px:
+    try:
+        hp = px.split("//", 1)[1].rstrip("/")
+        h, _, p = hp.rpartition(":")
+        s = socket.create_connection((h, int(p)), timeout=5); s.close()
+        print("proxy tcp : 可达", hp)
+    except Exception as e:
+        print("proxy tcp : 不可达 ->", e)
+for name, url in HOSTS:
+    try:
+        urllib.request.urlopen(url, timeout=8)
+        print(name, ": OK")
+    except Exception as e:
+        print(name, ":", str(e)[:70])
+'
+  local px=(); mapfile -t px < <(proxy_run_args)
+
+  rule
+  say "A  桥接网络（默认部署方式）"
+  docker run --rm --network "$NET" "${px[@]}" "$VLLM_IMAGE" python -c "$probe" 2>&1 | sed 's/^/    /'
+
+  echo
+  say "B  宿主机网络（HOST_NET=1 时的部署方式）"
+  local hpx=()
+  [ -n "$PROXY" ] && hpx=(-e "http_proxy=$PROXY" -e "https_proxy=$PROXY" \
+                          -e "HTTP_PROXY=$PROXY" -e "HTTPS_PROXY=$PROXY")
+  docker run --rm --network host "${hpx[@]}" "$VLLM_IMAGE" python -c "$probe" 2>&1 | sed 's/^/    /'
+  rule
+
+  say "怎么读这个结果"
+  dim "  A 里有任意一个源 OK        → 直接 deploy，不用代理"
+  dim "  A 全挂但 B 有 OK           → 代理只监听 127.0.0.1，加 HOST_NET=1"
+  dim "  A/B 都挂但 B 的 proxy tcp 可达 → 代理本身出不去，找网络同事"
+  dim "  哪个源 OK 就用哪个：MODEL_SOURCE=bos|modelscope|aistudio|huggingface"
+}
+
 cmd_server_help() {
   say "genai_server 真实可用参数（用于 MODEL / VLLM_ARGS）"
   docker run --rm "$VLLM_IMAGE" paddleocr genai_server --help
@@ -554,6 +632,7 @@ knock-ocr demo
   logs [api|vllm]
   test [文件]   端到端识别一次（不传文件则自动造一张）
   bench         并发压测，看 QPS / P50 / P95
+  netcheck      在容器里测能不能连上模型源（连不上模型时先跑这个）
   disk          镜像与模型缓存占了多少盘
   server-help   查看 genai_server 支持哪些参数（模型名对不对看这个）
   clean         删掉容器/网络/自建镜像（模型权重保留）
@@ -563,6 +642,8 @@ knock-ocr demo
   PORT=$PORT           对外端口；被别的服务占用会自动顺延，STRICT_PORT=1 可禁止
   BIND=$BIND        只本机访问传 127.0.0.1
   PROXY=                出网代理，如 http://127.0.0.1:7788（下模型权重用）
+  HOST_NET=0            =1 让 vLLM 走宿主机网络；代理只监听 127.0.0.1 时必须开
+  MODEL_SOURCE=bos      模型源 bos|modelscope|aistudio|huggingface
   WORKERS=$WORKERS            API 并行流水线数
   DEVICE=$DEVICE         auto|cpu|gpu:0，版面分析设备
   MODEL=$MODEL
@@ -591,6 +672,7 @@ case "${1:-deploy}" in
   pull)    shift; cmd_pull "$@" ;;
   build)   shift; cmd_build "$@" ;;
   preflight) shift; cmd_preflight "$@" ;;
+  netcheck) shift; cmd_netcheck "$@" ;;
   server-help) shift; cmd_server_help "$@" ;;
   clean)   shift; cmd_clean "$@" ;;
   help|-h|--help) cmd_help ;;
