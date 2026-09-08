@@ -21,6 +21,7 @@ DEVICE="${DEVICE:-auto}"                 # auto | cpu | gpu:0  —— Paddle 侧
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-2400}"     # 等服务就绪的秒数（首次要下模型，给足）
 VLLM_ARGS="${VLLM_ARGS:-}"               # 透传给 genai_server 的额外参数
 PROXY="${PROXY:-}"                       # 出网代理，如 http://127.0.0.1:7788（下模型权重要用）
+PROBE_TIMEOUT="${PROBE_TIMEOUT:-240}"    # GPU 探测单项超时，防止 import 卡死把 deploy 拖住
 
 REGISTRY="${REGISTRY:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle}"
 VLLM_IMAGE="${VLLM_IMAGE:-$REGISTRY/paddleocr-genai-vllm-server:latest-nvidia-gpu}"
@@ -163,7 +164,7 @@ cmd_gpucheck() {
   rule
   say "1/2  vLLM 侧（PyTorch）—— 硬要求"
   local torch_out torch_rc=0
-  torch_out="$(docker run --rm --gpus "device=$GPU_ID" "$VLLM_IMAGE" python -c '
+  torch_out="$(timeout -k 10 "$PROBE_TIMEOUT" docker run --rm --gpus "device=$GPU_ID" "$VLLM_IMAGE" python -c '
 import torch
 print("torch", torch.__version__, "cuda", torch.version.cuda)
 print("available", torch.cuda.is_available())
@@ -177,6 +178,9 @@ if torch.cuda.is_available():
   if [ $torch_rc -eq 0 ] && grep -q 'matmul ok' <<<"$torch_out"; then
     ok "PyTorch 可以在这张卡上跑核"
     sed 's/^/      /' <<<"$torch_out" | head -4
+  elif [ $torch_rc -eq 124 ] || [ $torch_rc -eq 137 ]; then
+    warn "PyTorch 探测 ${PROBE_TIMEOUT}s 超时"
+    sed 's/^/      /' <<<"$torch_out" | tail -8
   else
     warn "PyTorch 在这张卡上跑不起来 —— vLLM 一定会挂"
     sed 's/^/      /' <<<"$torch_out" | tail -12
@@ -188,7 +192,7 @@ if torch.cuda.is_available():
   local pd_out pd_rc=0
   # 不用 paddle.utils.run_check()：它顺带跑分布式自检，容器里常因无关原因失败，
   # 会把 GPU 可用误判成不可用。这里只做最小的真实核启动测试。
-  pd_out="$(docker run --rm --gpus "device=$GPU_ID" "$BASE_IMAGE" python -c '
+  pd_out="$(timeout -k 10 "$PROBE_TIMEOUT" docker run --rm --gpus "device=$GPU_ID" "$BASE_IMAGE" python -c '
 import paddle
 print("paddle", paddle.__version__)
 n = paddle.device.cuda.device_count()
@@ -204,7 +208,9 @@ print("matmul ok", float(paddle.matmul(x, x)[0, 0]))
     sed 's/^/      /' <<<"$pd_out" | head -4
     echo "gpu:0" > "$STATE/paddle_gpu"
   else
-    if grep -qiE 'no kernel image|sm_120|not compiled with|arch' <<<"$pd_out"; then
+    if [ $pd_rc -eq 124 ] || [ $pd_rc -eq 137 ]; then
+      warn "Paddle 探测 ${PROBE_TIMEOUT}s 超时（在不支持的架构上初始化会一直卡住）→ 版面分析走 CPU"
+    elif grep -qiE 'no kernel image|sm_120|not compiled with|arch' <<<"$pd_out"; then
       warn "Paddle 不含 sm_120 kernel（Blackwell 已知问题）→ 版面分析走 CPU"
     else
       warn "Paddle GPU 自检未通过 → 版面分析走 CPU"
@@ -336,29 +342,57 @@ diagnose() {
   dim "  改完配置直接重跑：bash scripts/manage.sh deploy（幂等，会自己清理）"
 }
 
+# 取容器最后一行有内容的日志，用来在等待时显示"它到底在干嘛"
+last_log_line() {
+  docker logs --tail 20 "$1" 2>&1 \
+    | tr -d '\r' | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+    | grep -vE '^\s*$' | tail -1 | cut -c1-100
+}
+
 wait_ready() {
-  say "等待服务就绪（首次需下载模型，可能几分钟到十几分钟）"
-  local t0 now spin=0
+  say "等待服务就绪"
+  dim "  首次启动要下模型权重 + vLLM 加载权重/捕获 CUDA graph，几分钟很正常。"
+  dim "  下面实时显示 vLLM 容器在做什么；完整日志另开终端：manage.sh logs vllm"
+  echo
+  local t0 now spin=0 elapsed line prev="" stuck=0
   local frames=('|' '/' '-' '\')
   t0="$(date +%s)"
   while :; do
-    now="$(date +%s)"
-    if [ $((now - t0)) -gt "$WAIT_TIMEOUT" ]; then
-      echo; warn "等待超时（${WAIT_TIMEOUT}s）"
-      dim "  bash scripts/manage.sh logs vllm"
+    now="$(date +%s)"; elapsed=$((now - t0))
+    if [ "$elapsed" -gt "$WAIT_TIMEOUT" ]; then
+      printf '\r\033[K'; warn "等待超时（${WAIT_TIMEOUT}s）"
+      dim "  容器还活着，只是没就绪。继续观察：bash scripts/manage.sh logs vllm"
       return 1
     fi
     for c in "$C_VLLM" "$C_API"; do
       if [ "$(container_state "$c")" != "running" ]; then
-        echo; diagnose "$c"; return 1
+        printf '\r\033[K'; diagnose "$c"; return 1
       fi
     done
     if http_ok "http://127.0.0.1:$PORT/healthz" \
        && grep -q '"ready": *true' <<<"$(curl -fsS -m 5 "http://127.0.0.1:$PORT/healthz")"; then
-      echo; ok "服务就绪"; return 0
+      printf '\r\033[K'; ok "服务就绪（用时 ${elapsed}s）"; return 0
     fi
+
+    line="$(last_log_line "$C_VLLM")"
+    if [ "$line" = "$prev" ]; then stuck=$((stuck + 3)); else stuck=0; prev="$line"; fi
+
     spin=$(( (spin + 1) % 4 ))
-    printf '\r    %s 已等待 %ss   ' "${frames[$spin]}" "$((now - t0))"
+    printf '\r\033[K  %s %3ds  %s' "${frames[$spin]}" "$elapsed" "${line:-（容器还没输出日志）}"
+
+    # 日志超过 3 分钟没动静，提示一下最可能的原因，但不中断
+    if [ "$stuck" -ge 180 ]; then
+      printf '\r\033[K'
+      warn "vLLM 日志已 ${stuck}s 没有新输出，最后一行是："
+      dim "      ${line:-（无）}"
+      if [ -z "$PROXY" ]; then
+        dim "      若卡在下载权重，多半是没走代理：PROXY=http://127.0.0.1:7788 bash scripts/manage.sh deploy"
+      else
+        dim "      已配代理 $PROXY；若卡在下载，试试直连（去掉 PROXY）或换镜像源"
+      fi
+      dim "      加载权重/捕获 CUDA graph 阶段本来就会静默数分钟，可以再等等"
+      stuck=0
+    fi
     sleep 3
   done
 }
