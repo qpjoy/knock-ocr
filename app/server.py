@@ -299,7 +299,7 @@ def info():
     try:
         import urllib.request
 
-        with urllib.request.urlopen(MODELS_URL, timeout=3) as r:
+        with urllib.request.urlopen(MODELS_URL, timeout=10) as r:
             data = json.loads(r.read().decode())
             backend["reachable"] = True
             backend["models"] = [m.get("id") for m in data.get("data", [])]

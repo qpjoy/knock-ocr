@@ -730,6 +730,44 @@ except Exception as e:
   dim "  把以上完整输出贴出来即可定位问题"
 }
 
+# 绕开本项目的 API 层，直接用官方 CLI 在 vLLM 容器内部跑一次完整识别。
+# 目的：把「模型能不能在这台机器上跑」和「我的 API 封装有没有 bug」彻底分开。
+cmd_selftest() {
+  [ "$(container_state "$C_VLLM")" = "running" ] || die "$C_VLLM 没在跑，先 deploy"
+
+  local f="${1:-}"
+  mkdir -p "$STATE"
+  if [ -z "$f" ]; then
+    say "生成测试图"
+    f="$STATE/sample.png"
+    docker run --rm -v "$STATE":/out:z "$API_IMAGE" python /app/make_sample.py /out/sample.png
+  fi
+  [ -f "$f" ] || die "文件不存在：$f"
+
+  say "把文件拷进 vLLM 容器"
+  docker cp "$f" "$C_VLLM:/tmp/selftest_input"
+
+  rule
+  say "用官方 CLI 直接识别（完全不经过本项目的 API 层）"
+  dim "  paddleocr doc_parser --vl_rec_backend vllm-server --vl_rec_server_url http://127.0.0.1:$VLLM_PORT/v1"
+  echo
+  docker exec "$C_VLLM" bash -lc "
+    cd /tmp && rm -rf selftest_out && mkdir -p selftest_out
+    paddleocr doc_parser --input /tmp/selftest_input --save_path /tmp/selftest_out \
+      --vl_rec_backend vllm-server \
+      --vl_rec_server_url http://127.0.0.1:$VLLM_PORT/v1 \
+      --device cpu 2>&1 | tail -40
+    echo '--- 产出文件 ---'
+    find /tmp/selftest_out -type f | head -20
+    echo '--- markdown 前 1500 字 ---'
+    find /tmp/selftest_out -name '*.md' -exec head -c 1500 {} \; 2>/dev/null
+  " || true
+  rule
+  say "怎么判断"
+  dim "  出现识别文本 → 模型在这台机器上完全可用，剩下的是本项目 API 层的问题"
+  dim "  这里就报错   → 是模型/服务端问题，把报错贴出来"
+}
+
 cmd_server_help() {
   say "genai_server 真实可用参数（用于 MODEL / VLLM_ARGS）"
   docker run --rm "$VLLM_IMAGE" paddleocr genai_server --help
@@ -762,6 +800,7 @@ knock-ocr demo
   test [文件]   端到端识别一次（不传文件则自动造一张）
   bench         并发压测，看 QPS / P50 / P95
   doctor        一次抓全所有诊断信息（卡住/报错时先跑这个）
+  selftest      绕开本项目 API，用官方 CLI 在 vLLM 容器内直接识别一次
   netcheck      在容器里测能不能连上模型源（连不上模型时先跑这个）
   disk          镜像与模型缓存占了多少盘
   server-help   查看 genai_server 支持哪些参数（模型名对不对看这个）
@@ -803,6 +842,7 @@ case "${1:-deploy}" in
   build)   shift; cmd_build "$@" ;;
   preflight) shift; cmd_preflight "$@" ;;
   doctor)  shift; cmd_doctor "$@" ;;
+  selftest) shift; cmd_selftest "$@" ;;
   netcheck) shift; cmd_netcheck "$@" ;;
   server-help) shift; cmd_server_help "$@" ;;
   clean)   shift; cmd_clean "$@" ;;
