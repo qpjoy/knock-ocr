@@ -103,6 +103,20 @@ inherited_proxy() {
   docker run --rm "$1" env 2>/dev/null | grep -iE '^(http|https|all)_proxy=' || true
 }
 
+# 生成测试图到宿主机路径 $1。
+# 不用 bind mount —— RHEL 上 SELinux + 容器内用户权限会导致写不进去（Errno 13）。
+# 改成容器内写 /tmp，再 docker cp 出来，零挂载零权限问题。
+gen_sample() {
+  local dst="$1" cid rc=0
+  mkdir -p "$(dirname "$dst")"
+  cid="$(docker create "$API_IMAGE" python /app/make_sample.py /tmp/sample.png)" || return 1
+  docker start -a "$cid" || rc=$?
+  if [ $rc -ne 0 ]; then docker rm -f "$cid" >/dev/null 2>&1; return 1; fi
+  docker cp "$cid:/tmp/sample.png" "$dst" >/dev/null || rc=$?
+  docker rm -f "$cid" >/dev/null 2>&1
+  return $rc
+}
+
 # ---------------------------------------------------------------- preflight
 cmd_preflight() {
   say "环境检查"
@@ -576,8 +590,9 @@ cmd_test() {
     [ -f "$f" ] || die "文件不存在：$f"
   else
     say "未指定文件，生成一张测试图"
-    mkdir -p "$STATE"; f="$STATE/sample.png"
-    docker run --rm -v "$STATE":/out:z "$API_IMAGE" python /app/make_sample.py /out/sample.png
+    f="$STATE/sample.png"
+    gen_sample "$f" || die "生成测试图失败；也可以自己指定：manage.sh test <文件路径>"
+    ok "已生成 $f"
   fi
   say "识别 $f"
   local t0 t1; t0="$(date +%s%3N)"
@@ -740,7 +755,8 @@ cmd_selftest() {
   if [ -z "$f" ]; then
     say "生成测试图"
     f="$STATE/sample.png"
-    docker run --rm -v "$STATE":/out:z "$API_IMAGE" python /app/make_sample.py /out/sample.png
+    gen_sample "$f" || die "生成测试图失败；也可以自己指定：manage.sh selftest <图片路径>"
+    ok "已生成 $f"
   fi
   [ -f "$f" ] || die "文件不存在：$f"
 
