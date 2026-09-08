@@ -110,6 +110,19 @@ container_home() {
   docker run --rm --entrypoint sh "$1" -c 'printf %s "$HOME"' 2>/dev/null || printf /root
 }
 
+# 镜像里运行进程的 uid:gid（官方镜像是非 root 的 paddleocr 用户）
+container_uidgid() {
+  docker run --rm --entrypoint sh "$1" -c 'printf "%s:%s" "$(id -u)" "$(id -g)"' 2>/dev/null || printf '0:0'
+}
+
+# 命名卷新建时是 root 属主，容器里的非 root 用户写不进去（Errno 13）。
+# 这里把卷的属主对齐到镜像实际用户，并放开权限，避免两个镜像 uid 不一致时又卡住。
+ensure_volume_perms() {
+  local vol="$1" img="$2" ug
+  ug="$(container_uidgid "$img")"
+  docker run --rm --user 0:0 --entrypoint sh -v "$vol":/vol "$img"     -c "chown -R $ug /vol 2>/dev/null; chmod -R a+rwX /vol 2>/dev/null; true" >/dev/null 2>&1 || true
+}
+
 # 生成测试图到宿主机路径 $1。
 # 不用 bind mount —— RHEL 上 SELinux + 容器内用户权限会导致写不进去（Errno 13）。
 # 改成容器内写 /tmp，再 docker cp 出来，零挂载零权限问题。
@@ -300,6 +313,15 @@ ensure_net() {
   docker volume inspect "$V_MODELS" >/dev/null 2>&1 || docker volume create "$V_MODELS" >/dev/null
   docker volume inspect "$V_HF"     >/dev/null 2>&1 || docker volume create "$V_HF" >/dev/null
   docker volume inspect "$V_MS"     >/dev/null 2>&1 || docker volume create "$V_MS" >/dev/null
+
+  # 卷属主对齐（容器以非 root 用户跑，卷默认 root 属主会导致 Errno 13）
+  say "对齐模型缓存卷属主"
+  local img="$API_IMAGE"
+  docker image inspect "$img" >/dev/null 2>&1 || img="$BASE_IMAGE"
+  for v in "$V_MODELS" "$V_HF" "$V_MS"; do
+    ensure_volume_perms "$v" "$img"
+  done
+  ok "卷属主已对齐为 $(container_uidgid "$img")"
 }
 
 cmd_pull() {
