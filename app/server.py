@@ -34,7 +34,22 @@ STATIC = APP_DIR / "static"
 
 DEVICE = os.environ.get("OCR_DEVICE", "cpu")
 MODEL = os.environ.get("OCR_MODEL", "PaddleOCR-VL-1.6-0.9B")
-VLLM_URL = os.environ.get("OCR_VLLM_URL", "http://127.0.0.1:8118")
+# backend 必须是 "vllm-server"（调用远端服务），不是 "vllm"（在本进程内自起引擎）。
+# 用 "vllm" 会让这个没有 GPU 的 API 容器自己去加载 0.9B 模型，然后无声卡死。
+# 依据是 genai_server 启动时打印的用法提示：
+#   --vl_rec_backend vllm-server --vl_rec_server_url http://localhost:8118/v1
+VL_BACKEND = os.environ.get("OCR_VL_BACKEND", "vllm-server")
+
+
+def _normalize_vllm_url(url: str) -> str:
+    """服务端要求带 /v1 后缀，统一补齐，避免配置漏写。"""
+    url = (url or "").rstrip("/")
+    if not url.endswith("/v1"):
+        url += "/v1"
+    return url
+
+
+VLLM_URL = _normalize_vllm_url(os.environ.get("OCR_VLLM_URL", "http://127.0.0.1:8118"))
 WORKERS = int(os.environ.get("OCR_WORKERS", "4"))
 MAX_MB = int(os.environ.get("OCR_MAX_MB", "50"))
 # 单请求排队等流水线的上限；超时直接 503，避免请求堆积拖垮服务
@@ -121,7 +136,7 @@ class PipelinePool:
         from paddleocr import PaddleOCRVL
 
         kwargs = {
-            "vl_rec_backend": "vllm",
+            "vl_rec_backend": VL_BACKEND,
             "vl_rec_server_url": VLLM_URL,
             "vl_rec_api_model_name": MODEL,
         }
@@ -130,16 +145,23 @@ class PipelinePool:
         return PaddleOCRVL(**kwargs)
 
     def warmup(self):
+        print(f"[pool] 开始构建 {self.size} 条流水线  backend={VL_BACKEND}  "
+              f"url={VLLM_URL}  device={DEVICE}  model={MODEL}", flush=True)
         for i in range(self.size):
+            t0 = time.perf_counter()
+            print(f"[pool] 构建第 {i + 1}/{self.size} 条…"
+                  f"（首次要下载版面分析模型，可能要几分钟）", flush=True)
             try:
                 self._q.put(self._build())
                 with self._lock:
                     self.ready += 1
+                print(f"[pool] 第 {i + 1}/{self.size} 条就绪"
+                      f"（{time.perf_counter() - t0:.1f}s）", flush=True)
             except Exception:
-                self.error = traceback.format_exc(limit=4)
-                print(f"[pool] 第 {i + 1} 个流水线构建失败:\n{self.error}", flush=True)
+                self.error = traceback.format_exc(limit=6)
+                print(f"[pool] 第 {i + 1} 条构建失败:\n{self.error}", flush=True)
                 return
-        print(f"[pool] {self.ready} 个流水线就绪 device={DEVICE} vllm={VLLM_URL}", flush=True)
+        print(f"[pool] 全部 {self.ready} 条流水线就绪", flush=True)
 
     @contextmanager
     def acquire(self, timeout: float):
@@ -286,6 +308,7 @@ def info():
         "model": MODEL,
         "benchmark": "OmniDocBench v1.6 96.3%",
         "layout_device": DEVICE,
+        "vl_backend": VL_BACKEND,
         "vlm_backend": backend,
         "workers": WORKERS,
         "pool": {"ready": POOL.ready, "idle": POOL.idle, "size": POOL.size},

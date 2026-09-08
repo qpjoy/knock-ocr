@@ -427,17 +427,19 @@ last_log_line() {
 
 wait_ready() {
   say "等待服务就绪"
-  dim "  首次启动要下模型权重 + vLLM 加载权重/捕获 CUDA graph，几分钟很正常。"
-  dim "  下面实时显示 vLLM 容器在做什么；完整日志另开终端：manage.sh logs vllm"
+  dim "  两个阶段：① vLLM 下权重并加载模型  ② API 侧构建 $WORKERS 条流水线（要下版面模型）"
+  dim "  下面显示两者各自的状态，并实时跟随当前还没好的那个容器的日志。"
+  dim "  完整日志：manage.sh logs vllm / manage.sh logs api"
   echo
   local t0 now spin=0 elapsed line prev="" stuck=0
+  local info vllm_up pool_ready watch stage
   local frames=('|' '/' '-' '\')
   t0="$(date +%s)"
   while :; do
     now="$(date +%s)"; elapsed=$((now - t0))
     if [ "$elapsed" -gt "$WAIT_TIMEOUT" ]; then
       printf '\r\033[K'; warn "等待超时（${WAIT_TIMEOUT}s）"
-      dim "  容器还活着，只是没就绪。继续观察：bash scripts/manage.sh logs vllm"
+      dim "  容器还活着，只是没就绪。看日志：manage.sh logs api / manage.sh logs vllm"
       return 1
     fi
     for c in "$C_VLLM" "$C_API"; do
@@ -445,28 +447,40 @@ wait_ready() {
         printf '\r\033[K'; diagnose "$c"; return 1
       fi
     done
-    if http_ok "http://127.0.0.1:$PORT/healthz" \
-       && grep -q '"ready": *true' <<<"$(curl -fsS -m 5 "http://127.0.0.1:$PORT/healthz")"; then
+
+    # /api/info 里既有 vLLM 后端可达性，也有流水线池进度，一次拿全
+    info="$(curl -fsS -m 5 "http://127.0.0.1:$PORT/api/info" 2>/dev/null || true)"
+    if grep -q '"reachable": *true' <<<"$info"; then vllm_up=yes; else vllm_up=no; fi
+    pool_ready="$(grep -o '"ready": *[0-9]\+' <<<"$info" | head -1 | grep -o '[0-9]\+' || true)"
+    pool_ready="${pool_ready:-0}"
+
+    if [ "$vllm_up" = yes ] && [ "$pool_ready" -gt 0 ]; then
       printf '\r\033[K'; ok "服务就绪（用时 ${elapsed}s）"; return 0
     fi
 
-    line="$(last_log_line "$C_VLLM")"
+    # 跟随「当前还没好的那个」的日志，别再一直盯着已经空闲的 vLLM
+    if [ "$vllm_up" = no ]; then watch="$C_VLLM"; stage="① vLLM 启动中"
+    else watch="$C_API"; stage="② API 构建流水线"; fi
+    line="$(last_log_line "$watch")"
     if [ "$line" = "$prev" ]; then stuck=$((stuck + 3)); else stuck=0; prev="$line"; fi
 
     spin=$(( (spin + 1) % 4 ))
-    printf '\r\033[K  %s %3ds  %s' "${frames[$spin]}" "$elapsed" "${line:-（容器还没输出日志）}"
+    printf '\r\033[K  %s %4ds  vllm=%s pool=%s/%s  %s  %s' \
+      "${frames[$spin]}" "$elapsed" "$vllm_up" "$pool_ready" "$WORKERS" "$stage" \
+      "${line:0:60}"
 
-    # 日志超过 3 分钟没动静，提示一下最可能的原因，但不中断
     if [ "$stuck" -ge 180 ]; then
       printf '\r\033[K'
-      warn "vLLM 日志已 ${stuck}s 没有新输出，最后一行是："
-      dim "      ${line:-（无）}"
-      if [ -z "$PROXY" ]; then
-        dim "      若卡在下载权重，多半是没走代理：PROXY=http://127.0.0.1:7788 bash scripts/manage.sh deploy"
+      warn "$watch 日志已 ${stuck}s 没有新输出（vllm=$vllm_up pool=$pool_ready/$WORKERS）"
+      dim "      最后一行：${line:-（无）}"
+      if [ "$vllm_up" = yes ]; then
+        dim "      vLLM 已就绪并在空闲等待，它不再输出日志是正常的。"
+        dim "      现在卡的是 API 侧：正在下载版面分析模型或构建流水线。"
+        dim "      看它在干嘛：bash scripts/manage.sh logs api"
       else
-        dim "      已配代理 $PROXY；若卡在下载，试试直连（去掉 PROXY）或换镜像源"
+        dim "      加载权重/捕获 CUDA graph 阶段本来就会静默数分钟，可以再等等"
+        dim "      若确认是卡在下载：manage.sh netcheck 查网络，或换 MODEL_SOURCE"
       fi
-      dim "      加载权重/捕获 CUDA graph 阶段本来就会静默数分钟，可以再等等"
       stuck=0
     fi
     sleep 3
