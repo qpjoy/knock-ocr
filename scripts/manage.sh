@@ -19,7 +19,7 @@ WORKERS="${WORKERS:-4}"                  # API 侧并行流水线数
 DEVICE="${DEVICE:-auto}"                 # auto | cpu | gpu:0  —— Paddle 侧（版面分析）跑在哪
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-2400}"     # 等服务就绪的秒数（首次要下模型，给足）
 VLLM_ARGS="${VLLM_ARGS:-}"               # 透传给 genai_server 的额外参数
-PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PROXY="${PROXY:-}"                       # 出网代理，如 http://127.0.0.1:7788（下模型权重要用）
 
 REGISTRY="${REGISTRY:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle}"
 VLLM_IMAGE="${VLLM_IMAGE:-$REGISTRY/paddleocr-genai-vllm-server:latest-nvidia-gpu}"
@@ -55,6 +55,21 @@ port_busy() {
 container_state() { docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null || echo "absent"; }
 
 http_ok() { curl -fsS -m 3 -o /dev/null "$1" 2>/dev/null; }
+
+# 容器里的 127.0.0.1 是容器自己，不是宿主机。桥接网络下要改走 host-gateway。
+proxy_for_container() { sed -E 's#//(127\.0\.0\.1|localhost)([:/]|$)#//host.docker.internal\2#' <<<"$1"; }
+
+# 输出 docker run 需要的代理相关参数（PROXY 未设则输出空）
+proxy_run_args() {
+  [ -z "$PROXY" ] && return 0
+  local p; p="$(proxy_for_container "$PROXY")"
+  printf '%s\n' \
+    --add-host "host.docker.internal:host-gateway" \
+    -e "http_proxy=$p"  -e "HTTP_PROXY=$p" \
+    -e "https_proxy=$p" -e "HTTPS_PROXY=$p" \
+    -e "no_proxy=localhost,127.0.0.1,$C_VLLM,$C_API" \
+    -e "NO_PROXY=localhost,127.0.0.1,$C_VLLM,$C_API"
+}
 
 # ---------------------------------------------------------------- preflight
 cmd_preflight() {
@@ -104,6 +119,16 @@ cmd_preflight() {
   # SELinux enforcing 下 bind mount 需要重打标签，脚本里已加 :z
   if have getenforce && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
     dim "      SELinux=Enforcing（已按需加 :z，正常情况无需额外处理）"
+  fi
+
+  if [ -n "$PROXY" ]; then
+    if curl -fsS -m 5 -x "$PROXY" -o /dev/null https://www.baidu.com 2>/dev/null; then
+      ok "代理可用：$PROXY（容器内会自动改写为 $(proxy_for_container "$PROXY")）"
+    else
+      warn "代理 $PROXY 从宿主机测不通，模型下载可能失败"
+    fi
+  else
+    dim "      未设代理。若模型下载卡住，加上：PROXY=http://127.0.0.1:7788"
   fi
 
   local free; free="$(df -Pk /var/lib/docker 2>/dev/null | awk 'NR==2{print int($4/1048576)}' || echo 0)"
@@ -165,11 +190,13 @@ cmd_pull() {
 }
 
 cmd_build() {
-  say "构建 API 镜像"
-  docker build \
+  say "构建 API 镜像（这一层不需要联网）"
+  local net=()
+  # 构建期若配了代理，用 host 网络，这样 127.0.0.1:7788 这类本地代理才通
+  [ -n "$PROXY" ] && net=(--network host --build-arg "http_proxy=$PROXY" --build-arg "https_proxy=$PROXY")
+  docker build "${net[@]}" \
     --build-arg "BASE_IMAGE=$BASE_IMAGE" \
-    --build-arg "PIP_INDEX_URL=$PIP_INDEX_URL" \
-    -f docker/api.Dockerfile -t "$API_IMAGE" . >/dev/null
+    -f docker/api.Dockerfile -t "$API_IMAGE" .
   ok "API 镜像就绪：$API_IMAGE"
 }
 
@@ -177,11 +204,13 @@ start_vllm() {
   [ "$(container_state "$C_VLLM")" = "running" ] && { ok "vLLM 已在运行"; return; }
   docker rm -f "$C_VLLM" >/dev/null 2>&1 || true
   say "启动 VLM 推理服务（GPU $GPU_ID）"
+  local px=(); mapfile -t px < <(proxy_run_args)
   # shellcheck disable=SC2086
   docker run -d --name "$C_VLLM" --network "$NET" \
     --gpus "device=$GPU_ID" \
     --restart unless-stopped \
     --shm-size 8g \
+    "${px[@]}" \
     -e VLLM_FLASH_ATTN_VERSION=2 \
     -v "$V_MODELS":/root/.paddlex \
     -v "$V_HF":/root/.cache/huggingface \
@@ -360,10 +389,13 @@ knock-ocr demo
   BIND=$BIND        只本机访问传 127.0.0.1
   WORKERS=$WORKERS            API 并行流水线数
   DEVICE=$DEVICE         auto|cpu|gpu:0，版面分析设备
+  PROXY=                出网代理，如 http://127.0.0.1:7788（下模型权重用）
+                        容器内会自动把 127.0.0.1 改写成 host.docker.internal
   MODEL=$MODEL
   PROJECT=$PROJECT     换名字可并存多套
 
 例
+  PROXY=http://127.0.0.1:7788 bash scripts/manage.sh deploy
   GPU_ID=1 PORT=9000 bash scripts/manage.sh deploy
   BIND=127.0.0.1 bash scripts/manage.sh deploy
 EOF

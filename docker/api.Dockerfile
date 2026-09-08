@@ -1,15 +1,14 @@
 ARG BASE_IMAGE=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:latest-nvidia-gpu
 FROM ${BASE_IMAGE}
 
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONUNBUFFERED=1 \
+ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# 官方镜像已带 paddleocr[doc-parser]，这里只补 Web 层
-RUN python -m pip install --no-cache-dir \
-        "fastapi>=0.110" "uvicorn[standard]>=0.29" "python-multipart>=0.0.9"
+# 官方镜像里 fastapi / uvicorn / starlette 都已具备，服务端代码也刻意不用
+# python-multipart（自己用标准库解析上传），所以这一层完全不需要联网。
+# 内网、代理不通、离线机器都能构建。
+RUN python -c "import fastapi, uvicorn, starlette; \
+print('fastapi', fastapi.__version__, '| uvicorn', uvicorn.__version__, '| starlette', starlette.__version__)"
 
 WORKDIR /app
 COPY app/ /app/

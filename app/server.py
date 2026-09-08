@@ -6,6 +6,9 @@
   GET  /api/metrics  进程内计数与延迟分位
   GET  /healthz      就绪探针
   GET  /             Web 界面
+
+刻意只依赖官方镜像里已有的包（fastapi / uvicorn / starlette），
+不引入 python-multipart —— 内网构建时 pip 可能出不去，多一个依赖就多一个卡点。
 """
 from __future__ import annotations
 
@@ -19,9 +22,10 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager, contextmanager
+from email.parser import BytesParser
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -37,6 +41,65 @@ MAX_MB = int(os.environ.get("OCR_MAX_MB", "50"))
 ACQUIRE_TIMEOUT = float(os.environ.get("OCR_ACQUIRE_TIMEOUT", "120"))
 
 ALLOWED = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".pdf"}
+
+# 魔数比文件名可靠：粘贴上来的截图往往没有正经文件名
+MAGIC = (
+    (b"%PDF", ".pdf"),
+    (bytes.fromhex("89504e470d0a1a0a"), ".png"),
+    (bytes.fromhex("ffd8ff"), ".jpg"),
+    (b"BM", ".bmp"),
+    (bytes.fromhex("49492a00"), ".tif"),
+    (bytes.fromhex("4d4d002a"), ".tif"),
+)
+
+CRLF = bytes.fromhex("0d0a")
+
+
+def sniff_suffix(blob: bytes, filename: str) -> str:
+    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+        return ".webp"
+    for magic, suffix in MAGIC:
+        if blob.startswith(magic):
+            return suffix
+    suffix = Path(filename or "").suffix.lower()
+    return suffix if suffix in ALLOWED else ""
+
+
+def parse_upload(content_type: str, body: bytes) -> tuple[str, bytes]:
+    """取出上传的文件，返回 (filename, bytes)。
+
+    两种调用方式都支持：
+        curl -F 'file=@a.png' http://host/api/ocr
+        curl --data-binary @a.png -H 'X-Filename: a.png' http://host/api/ocr
+    """
+    ctype = (content_type or "").strip()
+    if not ctype.lower().startswith("multipart/"):
+        return "", body
+
+    header = b"Content-Type: " + ctype.encode("latin-1", "replace") + CRLF + CRLF
+    try:
+        msg = BytesParser().parsebytes(header + body)
+    except Exception:
+        raise HTTPException(400, "multipart 解析失败")
+
+    if not msg.is_multipart():
+        raise HTTPException(400, "multipart 格式不正确")
+
+    fallback = None
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        fname = part.get_filename() or ""
+        if part.get_param("name", header="content-disposition") == "file" or fname:
+            return fname, payload
+        if fallback is None:
+            fallback = (fname, payload)
+    if fallback:
+        return fallback
+    raise HTTPException(400, "multipart 中没有找到文件")
 
 
 # --------------------------------------------------------------- 流水线池
@@ -117,10 +180,12 @@ class Metrics:
     def snapshot(self) -> dict:
         with self._lock:
             lat = sorted(self.lat)
+
         def pct(p):
             if not lat:
                 return None
             return round(lat[min(len(lat) - 1, int(len(lat) * p))], 1)
+
         return {
             "total": self.total,
             "failed": self.failed,
@@ -164,8 +229,7 @@ def _json_of(res) -> dict:
 
 
 def _run(pipeline, path: str, merge_tables: bool) -> tuple[str, list, int]:
-    out = pipeline.predict(path)
-    pages = list(out)
+    pages = list(pipeline.predict(path))
 
     # 多页 PDF 走官方重组，跨页表格能接起来
     if len(pages) > 1 and hasattr(pipeline, "restructure_pages"):
@@ -175,8 +239,8 @@ def _run(pipeline, path: str, merge_tables: bool) -> tuple[str, list, int]:
             if md:
                 return md, [_json_of(p) for p in pages], len(pages)
         except Exception:
-            print("[warn] restructure_pages 失败，回落逐页拼接:\n" + traceback.format_exc(limit=3),
-                  flush=True)
+            print("[warn] restructure_pages 失败，回落逐页拼接:\n"
+                  + traceback.format_exc(limit=3), flush=True)
 
     md = "\n\n---\n\n".join(filter(None, (_markdown_of(p) for p in pages)))
     return md, [_json_of(p) for p in pages], len(pages)
@@ -236,20 +300,27 @@ def metrics():
 
 @app.post("/api/ocr")
 async def ocr(
-    file: UploadFile = File(...),
+    request: Request,
     merge_tables: bool = Query(True, description="多页 PDF 是否合并跨页表格"),
     include_json: bool = Query(True, description="是否返回结构化结果"),
 ):
     rid = uuid.uuid4().hex[:12]
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in ALLOWED:
-        raise HTTPException(415, f"不支持的类型 {suffix or '(空)'}，支持：{sorted(ALLOWED)}")
 
-    blob = await file.read()
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(400, "空请求体")
+    if len(raw) > MAX_MB * 1024 * 1024:
+        raise HTTPException(413, f"请求超过 {MAX_MB}MB")
+
+    filename, blob = parse_upload(request.headers.get("content-type", ""), raw)
+    filename = filename or request.headers.get("x-filename", "") or "upload"
     if not blob:
         raise HTTPException(400, "空文件")
-    if len(blob) > MAX_MB * 1024 * 1024:
-        raise HTTPException(413, f"文件超过 {MAX_MB}MB")
+
+    suffix = sniff_suffix(blob, filename)
+    if suffix not in ALLOWED:
+        raise HTTPException(
+            415, f"无法识别的文件类型（文件名 {filename!r}）。支持：{sorted(ALLOWED)}")
 
     t0 = time.perf_counter()
     ok = False
@@ -265,12 +336,11 @@ async def ocr(
 
         md, pages_json, npages = await run_in_threadpool(work)
         ok = True
-        elapsed = (time.perf_counter() - t0) * 1000
         body = {
             "request_id": rid,
-            "filename": file.filename,
+            "filename": filename,
             "pages": npages,
-            "elapsed_ms": round(elapsed, 1),
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
             "markdown": md,
         }
         if include_json:
@@ -280,8 +350,7 @@ async def ocr(
     except HTTPException:
         raise
     except Exception:
-        tb = traceback.format_exc(limit=6)
-        print(f"[{rid}] 识别失败:\n{tb}", flush=True)
+        print(f"[{rid}] 识别失败:\n{traceback.format_exc(limit=6)}", flush=True)
         raise HTTPException(500, f"识别失败 (request_id={rid})")
     finally:
         METRICS.record((time.perf_counter() - t0) * 1000, ok)
