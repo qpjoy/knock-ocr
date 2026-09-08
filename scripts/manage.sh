@@ -22,7 +22,7 @@ WAIT_TIMEOUT="${WAIT_TIMEOUT:-2400}"     # 等服务就绪的秒数（首次要�
 VLLM_ARGS="${VLLM_ARGS:-}"               # 透传给 genai_server 的额外参数
 PROXY="${PROXY:-}"                       # 出网代理，如 http://127.0.0.1:7788（下模型权重要用）
 HOST_NET="${HOST_NET:-0}"                # =1 让 vLLM 走宿主机网络（代理只监听 127.0.0.1 时必须开）
-MODEL_SOURCE="${MODEL_SOURCE:-bos}"      # 模型源 bos|modelscope|aistudio|huggingface，国内优先 bos
+MODEL_SOURCE="${MODEL_SOURCE:-modelscope}" # 模型源 modelscope|aistudio|bos|huggingface；前三个境内直连可达
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-240}"    # GPU 探测单项超时，防止 import 卡死把 deploy 拖住
 
 REGISTRY="${REGISTRY:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle}"
@@ -76,6 +76,10 @@ proxy_for_container() { sed -E 's#//(127\.0\.0\.1|localhost)([:/]|$)#//host.dock
 # docker CLI 会把 ~/.docker/config.json 里的 proxies 自动注入每个容器。
 # 如果那里写的是 127.0.0.1:xxxx，容器里指的是容器自己 → 必然 Connection refused。
 # 所以这里总是显式接管所有代理变量：要么给正确的值，要么置空覆盖掉继承来的。
+# 国内模型源始终直连，不走代理。代理若在境外（比如日本节点），
+# 让 bcebos / modelscope / aistudio 绕出去会让 CDN 就近调度失效，下载慢一个数量级。
+DOMESTIC_DIRECT="bcebos.com,.bcebos.com,baidu.com,.baidu.com,modelscope.cn,.modelscope.cn,aliyuncs.com,.aliyuncs.com"
+
 proxy_run_args() {
   local p=""
   if [ -n "$PROXY" ]; then
@@ -84,12 +88,13 @@ proxy_run_args() {
   fi
   [ -n "$PROXY" ] && [ "$HOST_NET" != "1" ] && \
     printf '%s\n' --add-host "host.docker.internal:host-gateway"
+  local nop="localhost,127.0.0.1,$C_VLLM,$C_API,$DOMESTIC_DIRECT"
   printf '%s\n' \
     -e "http_proxy=$p"  -e "HTTP_PROXY=$p" \
     -e "https_proxy=$p" -e "HTTPS_PROXY=$p" \
     -e "all_proxy=$p"   -e "ALL_PROXY=$p" \
-    -e "no_proxy=localhost,127.0.0.1,$C_VLLM,$C_API" \
-    -e "NO_PROXY=localhost,127.0.0.1,$C_VLLM,$C_API"
+    -e "no_proxy=$nop" \
+    -e "NO_PROXY=$nop"
 }
 
 # 容器实际继承到的代理变量（诊断用）
@@ -371,12 +376,12 @@ diagnose() {
   fi
   if grep -qiE 'no model hoster|no available model hosting|could not prepare the official model' <<<"$logs"; then
     hit=1
-    warn "连不上模型源，权重下不下来（HuggingFace / ModelScope / AIStudio / BOS 全部不可达）"
+    warn "连不上模型源，权重下不下来"
     dim "      先查清容器到底能不能出网：bash scripts/manage.sh netcheck"
     dim "      最常见原因：代理只监听 127.0.0.1，桥接网络里的容器够不着 → 加 HOST_NET=1"
     dim "        HOST_NET=1 PROXY=$PROXY bash scripts/manage.sh deploy"
     dim "      国内机器优先试 BOS 直连（百度自家 CDN，往往不需要代理）："
-    dim "        MODEL_SOURCE=bos bash scripts/manage.sh deploy"
+    dim "        MODEL_SOURCE=modelscope bash scripts/manage.sh deploy   # 或 aistudio / bos"
   fi
   if grep -qi 'proxyerror' <<<"$logs" && grep -qE "127\.0\.0\.1', port=" <<<"$logs"; then
     hit=1
@@ -616,7 +621,7 @@ cmd_disk() {
 # 在「容器里」测网络 —— 宿主机能通不代表容器能通，这才是决定性的检查
 cmd_netcheck() {
   local probe='
-import os, socket, urllib.request, ssl
+import os, socket, ssl, urllib.request, urllib.error
 ssl._create_default_https_context = ssl._create_unverified_context
 HOSTS = [
     ("bos        ", "https://paddle-model-ecology.bj.bcebos.com"),
@@ -625,7 +630,7 @@ HOSTS = [
     ("huggingface", "https://huggingface.co"),
 ]
 px = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY") or ""
-print("proxy env :", px or "(未设置)")
+print("proxy env :", px or "(未设置，走直连)")
 if px:
     try:
         hp = px.split("//", 1)[1].rstrip("/")
@@ -637,9 +642,12 @@ if px:
 for name, url in HOSTS:
     try:
         urllib.request.urlopen(url, timeout=8)
-        print(name, ": OK")
+        print(name, ": 通")
+    except urllib.error.HTTPError as e:
+        # 能收到 HTTP 状态码就说明链路是通的。对象存储桶根路径返回 403 属正常。
+        print(name, ": 通  (HTTP %d，服务端拒绝列目录，不影响下载模型)" % e.code)
     except Exception as e:
-        print(name, ":", str(e)[:70])
+        print(name, ": 不通 ->", str(e)[:70])
 '
   local px=(); mapfile -t px < <(proxy_run_args)
 
@@ -668,10 +676,14 @@ for name, url in HOSTS:
   rule
 
   say "怎么读这个结果"
-  dim "  A 里有任意一个源 OK        → 直接 deploy，不用代理"
-  dim "  A 全挂但 B 有 OK           → 代理只监听 127.0.0.1，加 HOST_NET=1"
-  dim "  A/B 都挂但 B 的 proxy tcp 可达 → 代理本身出不去，找网络同事"
-  dim "  哪个源 OK 就用哪个：MODEL_SOURCE=bos|modelscope|aistudio|huggingface"
+  dim "  「通」包括返回 403/404 —— 收到 HTTP 状态码就说明链路没问题"
+  dim "  huggingface 在境内基本必然不通，不影响，我们不用它"
+  echo
+  dim "  A 里有任意一个源「通」      → 直接 deploy，不用代理"
+  dim "  A 全不通但 B 通             → 代理只监听 127.0.0.1，加 HOST_NET=1"
+  dim "  A/B 都不通但 proxy tcp 可达 → 代理本身出不去，找网络同事"
+  dim "  当前默认源：MODEL_SOURCE=$MODEL_SOURCE"
+  dim "  可选 bos|modelscope|aistudio|huggingface，前三个都在国内"
 }
 
 cmd_server_help() {
@@ -716,7 +728,7 @@ knock-ocr demo
   BIND=$BIND        只本机访问传 127.0.0.1
   PROXY=                出网代理，如 http://127.0.0.1:7788（下模型权重用）
   HOST_NET=0            =1 让 vLLM 走宿主机网络；代理只监听 127.0.0.1 时必须开
-  MODEL_SOURCE=bos      模型源 bos|modelscope|aistudio|huggingface
+  MODEL_SOURCE=modelscope  模型源 modelscope|aistudio|bos（境内直连）|huggingface（需境外代理）
   WORKERS=$WORKERS            API 并行流水线数
   DEVICE=$DEVICE         auto|cpu|gpu:0，版面分析设备
   MODEL=$MODEL
