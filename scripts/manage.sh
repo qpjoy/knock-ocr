@@ -35,8 +35,9 @@ NET="${PROJECT}-net"
 C_VLLM="${PROJECT}-vllm"
 C_API="${PROJECT}-api"
 V_MODELS="${PROJECT}-models"
-V_HF="${PROJECT}-hf"
-V_MS="${PROJECT}-modelscope"
+V_CACHE="${PROJECT}-cache"               # 整个 ~/.cache：huggingface / modelscope / vLLM 编译缓存
+                                         # 挂子目录会让 docker 以 root 造出父目录 ~/.cache，
+                                         # 导致 vLLM 写不了 ~/.cache/vllm 的 torch.compile 缓存
 STATE="$ROOT/.deploy"
 
 # ---------------------------------------------------------------- 输出
@@ -311,14 +312,13 @@ resolve_device() {
 ensure_net() {
   docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
   docker volume inspect "$V_MODELS" >/dev/null 2>&1 || docker volume create "$V_MODELS" >/dev/null
-  docker volume inspect "$V_HF"     >/dev/null 2>&1 || docker volume create "$V_HF" >/dev/null
-  docker volume inspect "$V_MS"     >/dev/null 2>&1 || docker volume create "$V_MS" >/dev/null
+  docker volume inspect "$V_CACHE"  >/dev/null 2>&1 || docker volume create "$V_CACHE" >/dev/null
 
   # 卷属主对齐（容器以非 root 用户跑，卷默认 root 属主会导致 Errno 13）
   say "对齐模型缓存卷属主"
   local img="$API_IMAGE"
   docker image inspect "$img" >/dev/null 2>&1 || img="$BASE_IMAGE"
-  for v in "$V_MODELS" "$V_HF" "$V_MS"; do
+  for v in "$V_MODELS" "$V_CACHE"; do
     ensure_volume_perms "$v" "$img"
   done
   ok "卷属主已对齐为 $(container_uidgid "$img")"
@@ -369,8 +369,7 @@ start_vllm() {
     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE" \
     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     -v "$V_MODELS":"$home/.paddlex" \
-    -v "$V_HF":"$home/.cache/huggingface" \
-    -v "$V_MS":"$home/.cache/modelscope" \
+    -v "$V_CACHE":"$home/.cache" \
     "$VLLM_IMAGE" \
     paddleocr genai_server --model_name "$MODEL" \
       --host 0.0.0.0 --port "$VLLM_PORT" --backend vllm $VLLM_ARGS >/dev/null
@@ -391,7 +390,12 @@ start_api() {
     vurl="http://host.docker.internal:$VLLM_PORT"
     extra=(--add-host "host.docker.internal:host-gateway")
   fi
+  # 必须挂 GPU：镜像里是 paddlepaddle 的 GPU 版，import paddle 就要 libcuda.so.1，
+  # 不挂的话直接 ImportError，跟我们只用 CPU 跑版面分析无关。
+  # 同时用 CUDA_VISIBLE_DEVICES="" 让它看不到任何设备 —— 拿到驱动库但不占显存、不碰 sm_120。
   docker run -d --name "$C_API" --network "$NET" \
+    --gpus "device=$GPU_ID" \
+    -e CUDA_VISIBLE_DEVICES="" \
     --restart unless-stopped \
     -p "$BIND:$PORT:8000" \
     "${extra[@]}" \
@@ -403,7 +407,7 @@ start_api() {
     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE" \
     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     -v "$V_MODELS":"$home/.paddlex" \
-    -v "$V_MS":"$home/.cache/modelscope" \
+    -v "$V_CACHE":"$home/.cache" \
     "$API_IMAGE" >/dev/null
   ok "容器 $C_API 已启动"
 }
@@ -667,7 +671,7 @@ cmd_disk() {
   say "镜像（拉过就不再拉，除非手动删）"
   docker images --format '  {{.Size}}\t{{.Repository}}:{{.Tag}}' | grep -E "paddleocr|$PROJECT" || dim "  （还没拉）"
   say "模型缓存卷（down/reset 都不会删）"
-  for v in "$V_MODELS" "$V_HF" "$V_MS"; do
+  for v in "$V_MODELS" "$V_CACHE"; do
     if docker volume inspect "$v" >/dev/null 2>&1; then
       local mp sz; mp="$(docker volume inspect -f '{{.Mountpoint}}' "$v")"
       sz="$(du -sh "$mp" 2>/dev/null | cut -f1)"
@@ -680,7 +684,7 @@ cmd_disk() {
   df -h /var/lib/docker 2>/dev/null | sed 's/^/  /'
   echo
   dim "  彻底删干净（下次要重下）："
-  dim "    docker volume rm $V_MODELS $V_HF $V_MS"
+  dim "    docker volume rm $V_MODELS $V_CACHE"
   dim "    docker image rm $VLLM_IMAGE $BASE_IMAGE"
   dim "  ⚠ 不要用 docker system prune -a，会把上面全清掉"
 }
@@ -833,7 +837,7 @@ print('paddlex[ocr] 依赖齐全')
   echo
   local px=(); mapfile -t px < <(proxy_run_args)
   local home; home="$(container_home "$API_IMAGE")"; home="${home:-/root}"
-  docker run --rm --network "$NET" "${px[@]}"     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE"     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True     -v "$V_MODELS":"$home/.paddlex"     -v "$V_MS":"$home/.cache/modelscope"     -v "$(cd "$(dirname "$f")" && pwd)":/in:ro     "$API_IMAGE" bash -lc "
+  docker run --rm --network "$NET" "${px[@]}"     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE"     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True     -v "$V_MODELS":"$home/.paddlex"     -v "$V_CACHE":"$home/.cache"     -v "$(cd "$(dirname "$f")" && pwd)":/in:ro     "$API_IMAGE" bash -lc "
       paddleocr doc_parser --input /in/$(basename "$f") --save_path /tmp/out         --vl_rec_backend vllm-server         --vl_rec_server_url http://$C_VLLM:$VLLM_PORT/v1         --device cpu 2>&1 | tail -40
       echo '--- 产出 ---'
       find /tmp/out -type f 2>/dev/null | head -20
@@ -858,7 +862,7 @@ cmd_clean() {
   docker image rm "$API_IMAGE" >/dev/null 2>&1 || true
   rm -rf "$STATE"
   ok "已清理"
-  dim "  模型缓存卷保留（重装免下载）：docker volume rm $V_MODELS $V_HF $V_MS"
+  dim "  模型缓存卷保留（重装免下载）：docker volume rm $V_MODELS $V_CACHE"
   dim "  官方基础镜像保留：docker image rm $VLLM_IMAGE $BASE_IMAGE"
 }
 
