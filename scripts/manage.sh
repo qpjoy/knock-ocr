@@ -100,6 +100,9 @@ proxy_run_args() {
     -e "NO_PROXY=$nop"
 }
 
+# 当前形态是否依赖外部 VLM 后端（将来接别的引擎时这里放宽）
+uses_vllm_backend() { [ -n "$VLLM_PORT" ]; }
+
 # 容器实际继承到的代理变量（诊断用）
 inherited_proxy() {
   docker run --rm "$1" env 2>/dev/null | grep -iE '^(http|https|all)_proxy=' || true
@@ -517,16 +520,19 @@ wait_ready() {
     pool_ready="$(grep -o '"ready": *[0-9]\+' <<<"$info" | head -1 | grep -o '[0-9]\+' || true)"
     pool_ready="${pool_ready:-0}"
 
-    # 就绪判据只看 pool：pool>0 说明引擎实例真的构造成功了，那才是真正的就绪信号。
-    # vllm 探活只是参考，探活假阴性（比如 warmup 占着 GIL 把探测饿死）不该卡死整个 deploy。
-    if [ "$pool_ready" -gt 0 ]; then
+    # 就绪 = 引擎实例构造成功(pool>0) 且 VLM 后端真的能服务(vllm_up)。
+    # 少了后者，deploy 会在 vLLM 还在加载权重时就宣布成功，一上传就失败。
+    if [ "$pool_ready" -gt 0 ] && { [ "$vllm_up" = yes ] || ! uses_vllm_backend; }; then
       printf '\r\033[K'; ok "服务就绪（用时 ${elapsed}s）"; return 0
     fi
 
     # 跟随「当前还没好的那个」的日志，别再一直盯着已经空闲的 vLLM
     # 只要 API 容器已经开始打 [pool] 日志，就跟随它 —— 那是真正决定就绪的一环。
     # 否则才盯 vLLM。避免 vllm 探活假阴性时，永远看不到 API 侧的真实报错。
-    if docker logs "$C_API" 2>&1 | grep -q "^.pool."; then
+    if [ "$pool_ready" -gt 0 ] && [ "$vllm_up" = no ]; then
+      # API 侧已经好了，只差后端 —— 明确说清楚，别让人以为整个卡住了
+      watch="$C_VLLM"; stage="① API 已就绪，等 vLLM 加载权重/编译"
+    elif docker logs "$C_API" 2>&1 | grep -q "^.pool."; then
       watch="$C_API"; stage="② 构建流水线"
     elif [ "$vllm_up" = no ]; then
       watch="$C_VLLM"; stage="① vLLM 启动中"

@@ -383,7 +383,8 @@ async def ocr(
         raise
     except Exception:
         print(f"[{rid}] 识别失败:\n{traceback.format_exc(limit=6)}", flush=True)
-        raise HTTPException(500, f"识别失败 (request_id={rid})")
+        # 把真实异常带到前端，否则界面只有一句"识别失败"，等于没说
+        raise HTTPException(500, f"识别失败 (request_id={rid}): {type(e).__name__}: {e}")
     finally:
         METRICS.record((time.perf_counter() - t0) * 1000, ok)
         if tmp:
