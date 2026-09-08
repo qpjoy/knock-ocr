@@ -104,6 +104,12 @@ inherited_proxy() {
   docker run --rm "$1" env 2>/dev/null | grep -iE '^(http|https|all)_proxy=' || true
 }
 
+# 官方镜像以 paddleocr 用户运行，HOME=/home/paddleocr，模型缓存落在那儿。
+# 之前把卷挂在 /root/.paddlex，等于没挂 —— 权重每次都要重下。这里动态取真实 HOME。
+container_home() {
+  docker run --rm --entrypoint sh "$1" -c 'printf %s "$HOME"' 2>/dev/null || printf /root
+}
+
 # 生成测试图到宿主机路径 $1。
 # 不用 bind mount —— RHEL 上 SELinux + 容器内用户权限会导致写不进去（Errno 13）。
 # 改成容器内写 /tmp，再 docker cp 出来，零挂载零权限问题。
@@ -330,6 +336,7 @@ start_vllm() {
     say "启动 VLM 推理服务（GPU $GPU_ID, model=$MODEL）"
   fi
   local px=(); mapfile -t px < <(proxy_run_args)
+  local home; home="$(container_home "$VLLM_IMAGE")"; home="${home:-/root}"
   # shellcheck disable=SC2086
   docker run -d --name "$C_VLLM" "${net[@]}" \
     --gpus "device=$GPU_ID" \
@@ -339,9 +346,9 @@ start_vllm() {
     -e VLLM_FLASH_ATTN_VERSION=2 \
     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE" \
     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
-    -v "$V_MODELS":/root/.paddlex \
-    -v "$V_HF":/root/.cache/huggingface \
-    -v "$V_MS":/root/.cache/modelscope \
+    -v "$V_MODELS":"$home/.paddlex" \
+    -v "$V_HF":"$home/.cache/huggingface" \
+    -v "$V_MS":"$home/.cache/modelscope" \
     "$VLLM_IMAGE" \
     paddleocr genai_server --model_name "$MODEL" \
       --host 0.0.0.0 --port "$VLLM_PORT" --backend vllm $VLLM_ARGS >/dev/null
@@ -352,6 +359,10 @@ start_api() {
   local dev="$1"
   docker rm -f "$C_API" >/dev/null 2>&1 || true
   say "启动 API + Web 服务（版面分析设备：$dev）"
+  # 和 vLLM 容器一样必须显式接管代理变量，否则会继承 docker 注入的 127.0.0.1:7788，
+  # 下版面分析模型时四个源全部走那个不存在的代理 -> 流水线一条都建不起来。
+  local px=(); mapfile -t px < <(proxy_run_args)
+  local home; home="$(container_home "$API_IMAGE")"; home="${home:-/root}"
   # vLLM 若在宿主机网络，容器名解析不到，改用 host-gateway
   local vurl="http://$C_VLLM:$VLLM_PORT" extra=()
   if [ "$HOST_NET" = "1" ]; then
@@ -362,14 +373,15 @@ start_api() {
     --restart unless-stopped \
     -p "$BIND:$PORT:8000" \
     "${extra[@]}" \
+    "${px[@]}" \
     -e "OCR_DEVICE=$dev" \
     -e "OCR_MODEL=$MODEL" \
     -e "OCR_VLLM_URL=$vurl" \
     -e "OCR_WORKERS=$WORKERS" \
     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE" \
     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
-    -v "$V_MODELS":/root/.paddlex \
-    -v "$V_MS":/root/.cache/modelscope \
+    -v "$V_MODELS":"$home/.paddlex" \
+    -v "$V_MS":"$home/.cache/modelscope" \
     "$API_IMAGE" >/dev/null
   ok "容器 $C_API 已启动"
 }
@@ -798,7 +810,8 @@ print('paddlex[ocr] 依赖齐全')
   dim "  镜像 $API_IMAGE，网络 $NET，后端 http://$C_VLLM:$VLLM_PORT/v1"
   echo
   local px=(); mapfile -t px < <(proxy_run_args)
-  docker run --rm --network "$NET" "${px[@]}"     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE"     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True     -v "$V_MODELS":/root/.paddlex     -v "$V_MS":/root/.cache/modelscope     -v "$(cd "$(dirname "$f")" && pwd)":/in:ro     "$API_IMAGE" bash -lc "
+  local home; home="$(container_home "$API_IMAGE")"; home="${home:-/root}"
+  docker run --rm --network "$NET" "${px[@]}"     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE"     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True     -v "$V_MODELS":"$home/.paddlex"     -v "$V_MS":"$home/.cache/modelscope"     -v "$(cd "$(dirname "$f")" && pwd)":/in:ro     "$API_IMAGE" bash -lc "
       paddleocr doc_parser --input /in/$(basename "$f") --save_path /tmp/out         --vl_rec_backend vllm-server         --vl_rec_server_url http://$C_VLLM:$VLLM_PORT/v1         --device cpu 2>&1 | tail -40
       echo '--- 产出 ---'
       find /tmp/out -type f 2>/dev/null | head -20
