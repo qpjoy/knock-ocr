@@ -211,11 +211,14 @@ async function send(f){
     $('#srcText').textContent = d.markdown || '';
     $('#jsonText').textContent = JSON.stringify(d.result ?? {}, null, 2);
     const chars = (d.markdown||'').length;
+    const tm = d.timings || {};
     $('#meta').innerHTML =
       `<span>页数 <b>${d.pages}</b></span>` +
-      `<span>服务端 <b>${d.elapsed_ms}</b> ms</span>` +
-      `<span>端到端 <b>${(performance.now()-t0).toFixed(0)}</b> ms</span>` +
       `<span>字符 <b>${chars}</b></span>` +
+      `<span>端到端 <b>${(performance.now()-t0).toFixed(0)}</b> ms</span>` +
+      `<span title="服务端接收请求体的时间">接收 <b>${tm.receive_ms ?? '-'}</b> ms</span>` +
+      `<span title="等待空闲流水线的时间，高说明并发打满了">排队 <b>${tm.queue_ms ?? '-'}</b> ms</span>` +
+      `<span title="版面分析 + VLM 逐块生成，这里才是大头">推理 <b>${tm.infer_ms ?? '-'}</b> ms</span>` +
       `<span style="color:var(--dim)">${d.request_id}</span>`;
     poll();
   }catch(err){

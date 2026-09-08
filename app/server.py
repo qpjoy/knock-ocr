@@ -330,6 +330,7 @@ async def ocr(
     include_json: bool = Query(True, description="是否返回结构化结果"),
 ):
     rid = uuid.uuid4().hex[:12]
+    t_start = time.perf_counter()
 
     # 池子没就绪就立刻拒绝，别让请求傻等 ACQUIRE_TIMEOUT 秒把界面挂住
     if POOL.ready == 0:
@@ -339,6 +340,7 @@ async def ocr(
         raise HTTPException(503, detail)
 
     raw = await request.body()
+    t_body = time.perf_counter()
     if not raw:
         raise HTTPException(400, "空请求体")
     if len(raw) > MAX_MB * 1024 * 1024:
@@ -354,25 +356,34 @@ async def ocr(
         raise HTTPException(
             415, f"无法识别的文件类型（文件名 {filename!r}）。支持：{sorted(ALLOWED)}")
 
-    t0 = time.perf_counter()
     ok = False
     tmp = None
+    timings = {"receive_ms": round((t_body - t_start) * 1000, 1)}
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
             fh.write(blob)
             tmp = fh.name
 
+        # 分段计时，用来回答「慢在哪」：上传？排队？还是推理本身？
         def work():
+            q0 = time.perf_counter()
             with POOL.acquire(ACQUIRE_TIMEOUT) as pipeline:
-                return _run(pipeline, tmp, merge_tables)
+                q1 = time.perf_counter()
+                out = _run(pipeline, tmp, merge_tables)
+                timings["queue_ms"] = round((q1 - q0) * 1000, 1)
+                timings["infer_ms"] = round((time.perf_counter() - q1) * 1000, 1)
+                return out
 
         md, pages_json, npages = await run_in_threadpool(work)
         ok = True
+        timings["total_ms"] = round((time.perf_counter() - t_start) * 1000, 1)
         body = {
             "request_id": rid,
             "filename": filename,
+            "bytes": len(blob),
             "pages": npages,
-            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "elapsed_ms": timings["total_ms"],
+            "timings": timings,
             "markdown": md,
         }
         if include_json:
@@ -381,12 +392,12 @@ async def ocr(
 
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
         print(f"[{rid}] 识别失败:\n{traceback.format_exc(limit=6)}", flush=True)
         # 把真实异常带到前端，否则界面只有一句"识别失败"，等于没说
         raise HTTPException(500, f"识别失败 (request_id={rid}): {type(e).__name__}: {e}")
     finally:
-        METRICS.record((time.perf_counter() - t0) * 1000, ok)
+        METRICS.record((time.perf_counter() - t_start) * 1000, ok)
         if tmp:
             try:
                 os.unlink(tmp)
