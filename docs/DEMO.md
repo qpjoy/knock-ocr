@@ -121,14 +121,93 @@ bash scripts/manage.sh bench -c 16 -n 160
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GPU_ID` | `2` | 只占用这一张卡 |
-| `PORT` | `8710` | 对外 Web + API 端口 |
+| `PORT` | `8710` | 对外 Web + API 端口；被别的服务占用会自动顺延 |
+| `STRICT_PORT` | `0` | `=1` 则端口被占直接报错，不顺延 |
 | `BIND` | `0.0.0.0` | 传 `127.0.0.1` 则仅本机可访问 |
+| `PROXY` | 空 | 出网代理；不设则强制直连（并覆盖 docker 注入的代理变量） |
+| `HOST_NET` | `0` | `=1` 让 vLLM 走宿主机网络，代理只监听回环时用 |
+| `MODEL_SOURCE` | `bos` | `bos` / `modelscope` / `aistudio` / `huggingface` |
 | `WORKERS` | `4` | API 侧并行流水线数 |
 | `DEVICE` | `auto` | `auto` / `cpu` / `gpu:0`，版面分析设备 |
 | `MODEL` | `PaddleOCR-VL-1.6-0.9B` | |
 | `PROJECT` | `knock-ocr` | 改名可并存多套 |
 | `VLLM_ARGS` | 空 | 透传给 `genai_server`；先用 `manage.sh server-help` 查真实可用参数 |
-| `PIP_INDEX_URL` | 清华源 | 构建 API 镜像时用 |
+| `PROBE_TIMEOUT` | `240` | GPU 探测单项超时 |
+| `WAIT_TIMEOUT` | `2400` | 等服务就绪的上限 |
+
+---
+
+## 七点五、代理与网络（本机踩过的坑）
+
+### 现象
+
+vLLM 容器启动几十秒后退出，日志里是：
+
+```
+ProxyError: ... HTTPSConnection(host='127.0.0.1', port=7788): Connection refused
+RuntimeError: Could not prepare the official model for the 'PaddleOCR-VL-1.6-0.9B' model
+```
+
+### 原因
+
+`~/.docker/config.json` 里配了客户端级代理：
+
+```json
+"proxies": { "default": {
+    "httpProxy":  "http://127.0.0.1:7788",
+    "httpsProxy": "http://127.0.0.1:7788",
+    "noProxy": "localhost,127.0.0.1,.local"
+}}
+```
+
+docker CLI 会把它作为环境变量**注入每一个容器**。而容器里的 `127.0.0.1` 指的是容器自己，
+不是宿主机 —— 所以任何出网请求都会 `Connection refused`。这同样会让构建期的 `pip install` 失败。
+
+验证：
+
+```bash
+docker run --rm <任意镜像> env | grep -i proxy
+```
+
+### 处理方式：只在本项目内解决，不动全局
+
+这台机器上其他应用依赖这份全局代理配置，**不要修改它**。
+本脚本的做法是在自己两个容器的 `docker run` 上显式覆盖，作用域仅限本项目：
+
+```
+docker run ... -e http_proxy= -e https_proxy= -e all_proxy= ...
+```
+
+`docker build` 同理，传空的 `--build-arg http_proxy=` 覆盖构建期注入。
+
+两种可选模式，都不触碰全局配置：
+
+| 模式 | 命令 | 说明 |
+|---|---|---|
+| 直连（默认） | `bash scripts/manage.sh deploy` | 置空代理变量，走 BOS 直连。国内机器首选 |
+| 借用全局代理 | `HOST_NET=1 PROXY=http://127.0.0.1:7788 bash scripts/manage.sh deploy` | 容器共享宿主机网络，`127.0.0.1:7788` 此时就是宿主机的代理，无需改其监听地址 |
+
+### 拿不准走哪条就先诊断
+
+```bash
+bash scripts/manage.sh netcheck
+```
+
+在容器里分别用桥接网络和宿主机网络，测四个模型源与代理的可达性：
+
+| 结果 | 结论 |
+|---|---|
+| A 段有源 OK | 直接 `deploy`，不用代理 |
+| A 全挂、B 有 OK | 代理只监听回环 → 加 `HOST_NET=1` |
+| A/B 都挂但 B 的 proxy tcp 可达 | 代理本身出不去，需要网络侧协助 |
+
+### 模型源
+
+`MODEL_SOURCE` 可选 `bos`（默认）/ `modelscope` / `aistudio` / `huggingface`。
+国内内网优先 `bos`（百度自家 CDN，通常直连可达）。
+
+另外两个容器都已设 `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True` ——
+PaddleX 启动时会先做一轮模型源连通性预检，很慢（实测卡了 20 多分钟）且失败即放弃下载。
 
 ---
 

@@ -73,15 +73,28 @@ free_port() {
 # 容器里的 127.0.0.1 是容器自己，不是宿主机。桥接网络下要改走 host-gateway。
 proxy_for_container() { sed -E 's#//(127\.0\.0\.1|localhost)([:/]|$)#//host.docker.internal\2#' <<<"$1"; }
 
+# docker CLI 会把 ~/.docker/config.json 里的 proxies 自动注入每个容器。
+# 如果那里写的是 127.0.0.1:xxxx，容器里指的是容器自己 → 必然 Connection refused。
+# 所以这里总是显式接管所有代理变量：要么给正确的值，要么置空覆盖掉继承来的。
 proxy_run_args() {
-  [ -z "$PROXY" ] && return 0
-  local p; p="$(proxy_for_container "$PROXY")"
+  local p=""
+  if [ -n "$PROXY" ]; then
+    if [ "$HOST_NET" = "1" ]; then p="$PROXY"   # 宿主机网络下 127.0.0.1 就是对的
+    else p="$(proxy_for_container "$PROXY")"; fi
+  fi
+  [ -n "$PROXY" ] && [ "$HOST_NET" != "1" ] && \
+    printf '%s\n' --add-host "host.docker.internal:host-gateway"
   printf '%s\n' \
-    --add-host "host.docker.internal:host-gateway" \
     -e "http_proxy=$p"  -e "HTTP_PROXY=$p" \
     -e "https_proxy=$p" -e "HTTPS_PROXY=$p" \
+    -e "all_proxy=$p"   -e "ALL_PROXY=$p" \
     -e "no_proxy=localhost,127.0.0.1,$C_VLLM,$C_API" \
     -e "NO_PROXY=localhost,127.0.0.1,$C_VLLM,$C_API"
+}
+
+# 容器实际继承到的代理变量（诊断用）
+inherited_proxy() {
+  docker run --rm "$1" env 2>/dev/null | grep -iE '^(http|https|all)_proxy=' || true
 }
 
 # ---------------------------------------------------------------- preflight
@@ -140,12 +153,33 @@ cmd_preflight() {
     dim "      SELinux=Enforcing（bind mount 已加 :z，正常情况无需额外处理）"
   fi
 
+  # docker 是否会往容器里硬塞代理变量 —— 指向 127.0.0.1 的话容器必然连不上
+  if docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1; then
+    local inh; inh="$(inherited_proxy "$VLLM_IMAGE")"
+    if [ -n "$inh" ]; then
+      warn "docker 会向容器注入代理变量（来自 ~/.docker/config.json）："
+      sed 's/^/      /' <<<"$inh"
+      if grep -qE '127\.0\.0\.1|localhost' <<<"$inh"; then
+        warn "其中指向 127.0.0.1 —— 在容器里这是容器自己，必然 Connection refused"
+      fi
+      dim "      本脚本会显式覆盖这些变量，不受它影响"
+    else
+      ok "docker 没有向容器注入代理变量"
+    fi
+  fi
+
   if [ -n "$PROXY" ]; then
     if curl -fsS -m 5 -x "$PROXY" -o /dev/null https://www.baidu.com 2>/dev/null; then
-      ok "代理可用：$PROXY（容器内改写为 $(proxy_for_container "$PROXY")）"
+      if [ "$HOST_NET" = "1" ]; then
+        ok "代理可用：$PROXY（宿主机网络，容器内直接用同一地址）"
+      else
+        ok "代理可用：$PROXY（容器内改写为 $(proxy_for_container "$PROXY")）"
+      fi
     else
       warn "代理 $PROXY 从宿主机测不通，模型下载可能失败"
     fi
+  else
+    ok "不使用代理（容器内代理变量已被置空，走直连）"
   fi
 
   local free; free="$(df -Pk /var/lib/docker 2>/dev/null | awk 'NR==2{print int($4/1048576)}' || echo 0)"
@@ -249,8 +283,14 @@ cmd_pull() {
 
 cmd_build() {
   say "构建 API 镜像（这一层不需要联网）"
-  local net=()
-  [ -n "$PROXY" ] && net=(--network host --build-arg "http_proxy=$PROXY" --build-arg "https_proxy=$PROXY")
+  # 同样要覆盖 docker 从 config.json 注入的构建期代理，否则 RUN 一旦联网就挂
+  local net=(--build-arg "http_proxy=" --build-arg "https_proxy="
+             --build-arg "HTTP_PROXY=" --build-arg "HTTPS_PROXY=")
+  if [ -n "$PROXY" ]; then
+    net=(--network host
+         --build-arg "http_proxy=$PROXY"  --build-arg "https_proxy=$PROXY"
+         --build-arg "HTTP_PROXY=$PROXY"  --build-arg "HTTPS_PROXY=$PROXY")
+  fi
   docker build "${net[@]}" --build-arg "BASE_IMAGE=$BASE_IMAGE" \
     -f docker/api.Dockerfile -t "$API_IMAGE" .
   ok "API 镜像就绪：$API_IMAGE"
@@ -337,6 +377,13 @@ diagnose() {
     dim "        HOST_NET=1 PROXY=$PROXY bash scripts/manage.sh deploy"
     dim "      国内机器优先试 BOS 直连（百度自家 CDN，往往不需要代理）："
     dim "        MODEL_SOURCE=bos bash scripts/manage.sh deploy"
+  fi
+  if grep -qi 'proxyerror' <<<"$logs" && grep -qE "127\.0\.0\.1', port=" <<<"$logs"; then
+    hit=1
+    warn "容器把 127.0.0.1 当代理了 —— 那是容器自己，必然 Connection refused"
+    dim "      来源多半是 ~/.docker/config.json 的 proxies，docker 会注入每个容器"
+    dim "      查看：cat ~/.docker/config.json"
+    dim "      本脚本现在会显式覆盖这些变量，更新代码后重跑即可"
   fi
   if grep -qiE 'proxyerror|max retries|connection refused|connection reset|timed out|temporary failure in name resolution' <<<"$logs"; then
     hit=1
@@ -583,12 +630,24 @@ for name, url in HOSTS:
   local px=(); mapfile -t px < <(proxy_run_args)
 
   rule
-  say "A  桥接网络（默认部署方式）"
+  say "0  docker 默认往容器里塞了什么代理变量"
+  local inh; inh="$(inherited_proxy "$VLLM_IMAGE")"
+  if [ -n "$inh" ]; then
+    sed 's/^/    /' <<<"$inh"
+    if grep -qE '127\.0\.0\.1|localhost' <<<"$inh"; then
+      warn "指向 127.0.0.1 —— 容器里那是容器自己，必然连不上（本脚本已覆盖它）"
+    fi
+  else
+    dim "    （无）"
+  fi
+
+  echo
+  say "A  桥接网络（默认部署方式，代理按当前 PROXY 设置）"
   docker run --rm --network "$NET" "${px[@]}" "$VLLM_IMAGE" python -c "$probe" 2>&1 | sed 's/^/    /'
 
   echo
   say "B  宿主机网络（HOST_NET=1 时的部署方式）"
-  local hpx=()
+  local hpx=(-e "http_proxy=" -e "https_proxy=" -e "HTTP_PROXY=" -e "HTTPS_PROXY=")
   [ -n "$PROXY" ] && hpx=(-e "http_proxy=$PROXY" -e "https_proxy=$PROXY" \
                           -e "HTTP_PROXY=$PROXY" -e "HTTPS_PROXY=$PROXY")
   docker run --rm --network host "${hpx[@]}" "$VLLM_IMAGE" python -c "$probe" 2>&1 | sed 's/^/    /'
