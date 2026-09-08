@@ -50,6 +50,23 @@ def _normalize_vllm_url(url: str) -> str:
 
 
 VLLM_URL = _normalize_vllm_url(os.environ.get("OCR_VLLM_URL", "http://127.0.0.1:8118"))
+
+
+def _num_env(name, cast=int):
+    v = os.environ.get(name, "").strip()
+    return cast(v) if v else None
+
+
+# ---- 性能相关旋钮 ----
+# vl_rec_max_concurrency 官方默认是 None（不并发）。PaddleOCR 会把版面切出的子图
+# 分组请求 VLM 服务；不并发就是一块一块串行发，vLLM 的连续批处理完全用不上 ——
+# 一张密集截图能因此跑到上百秒。这里给一个务实的默认值。
+VL_CONCURRENCY = _num_env("OCR_VL_CONCURRENCY") or 8
+# 限制送进 VLM 的像素数，大图先降采样。块少了、每块也小，速度直接下来。
+MAX_PIXELS = _num_env("OCR_MAX_PIXELS")
+# 单块生成 token 上限，防止个别块跑飞把整页拖死
+MAX_NEW_TOKENS = _num_env("OCR_MAX_NEW_TOKENS")
+LAYOUT_THRESHOLD = _num_env("OCR_LAYOUT_THRESHOLD", float)
 # VLLM_URL 已经以 /v1 结尾，探活地址只需再接 /models，别重复拼 /v1
 MODELS_URL = VLLM_URL + "/models"
 WORKERS = int(os.environ.get("OCR_WORKERS", "4"))
@@ -137,14 +154,35 @@ class PipelinePool:
     def _build(self):
         from paddleocr import PaddleOCRVL
 
-        kwargs = {
+        base = {
             "vl_rec_backend": VL_BACKEND,
             "vl_rec_server_url": VLLM_URL,
             "vl_rec_api_model_name": MODEL,
         }
         if DEVICE:
-            kwargs["device"] = DEVICE
-        return PaddleOCRVL(**kwargs)
+            base["device"] = DEVICE
+
+        # 性能参数按版本可能不被接受，单独放一组，被拒就逐个丢掉重试，
+        # 保证换镜像版本时不会因为一个未知参数把整个服务起不来。
+        tuning = {}
+        if VL_CONCURRENCY:
+            tuning["vl_rec_max_concurrency"] = VL_CONCURRENCY
+        if MAX_PIXELS:
+            tuning["max_pixels"] = MAX_PIXELS
+        if MAX_NEW_TOKENS:
+            tuning["max_new_tokens"] = MAX_NEW_TOKENS
+        if LAYOUT_THRESHOLD:
+            tuning["layout_threshold"] = LAYOUT_THRESHOLD
+
+        while True:
+            try:
+                return PaddleOCRVL(**base, **tuning)
+            except TypeError as e:
+                dropped = next((k for k in tuning if k in str(e)), None)
+                if not dropped:
+                    raise
+                tuning.pop(dropped)
+                print(f"[pool] 本版本不支持参数 {dropped}，已忽略（{e}）", flush=True)
 
     def warmup(self):
         print(f"[pool] 开始构建 {self.size} 条流水线  backend={VL_BACKEND}  "
@@ -310,6 +348,12 @@ def info():
         "model": MODEL,
         "benchmark": "OmniDocBench v1.6 96.3%",
         "layout_device": DEVICE,
+        "tuning": {
+            "vl_rec_max_concurrency": VL_CONCURRENCY,
+            "max_pixels": MAX_PIXELS,
+            "max_new_tokens": MAX_NEW_TOKENS,
+            "layout_threshold": LAYOUT_THRESHOLD,
+        },
         "vl_backend": VL_BACKEND,
         "vlm_backend": backend,
         "workers": WORKERS,

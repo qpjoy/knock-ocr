@@ -24,6 +24,17 @@ PROXY="${PROXY:-}"                       # 出网代理，如 http://127.0.0.1:7
 HOST_NET="${HOST_NET:-0}"                # =1 让 vLLM 走宿主机网络（代理只监听 127.0.0.1 时必须开）
 MODEL_SOURCE="${MODEL_SOURCE:-modelscope}" # 模型源 modelscope|aistudio|bos|huggingface；前三个境内直连可达
 PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"  # 仅镜像缺依赖时才用到
+FAST="${FAST:-0}"                        # =1 快速模式：更高并发 + 限像素限 token，牺牲少量细节换速度
+# vl_rec_max_concurrency 官方默认 None（串行逐块请求 VLM），是最大的性能瓶颈。
+if [ "$FAST" = "1" ]; then
+  VL_CONCURRENCY="${VL_CONCURRENCY:-16}"
+  MAX_PIXELS="${MAX_PIXELS:-1600000}"    # 约 1600x1000，正文够清晰，切块数明显减少
+  MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+else
+  VL_CONCURRENCY="${VL_CONCURRENCY:-8}"
+  MAX_PIXELS="${MAX_PIXELS:-}"
+  MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
+fi
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-120}"    # GPU 探测单项超时；正常十几秒，挂住的才等满
 
 REGISTRY="${REGISTRY:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle}"
@@ -407,6 +418,9 @@ start_api() {
     -e "OCR_MODEL=$MODEL" \
     -e "OCR_VLLM_URL=$vurl" \
     -e "OCR_WORKERS=$WORKERS" \
+    -e "OCR_VL_CONCURRENCY=$VL_CONCURRENCY" \
+    -e "OCR_MAX_PIXELS=$MAX_PIXELS" \
+    -e "OCR_MAX_NEW_TOKENS=$MAX_NEW_TOKENS" \
     -e PADDLE_PDX_MODEL_SOURCE="$MODEL_SOURCE" \
     -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     -v "$V_MODELS":"$home/.paddlex" \
@@ -900,6 +914,9 @@ knock-ocr demo
   BIND=$BIND        只本机访问传 127.0.0.1
   PROXY=                出网代理，如 http://127.0.0.1:7788（下模型权重用）
   HOST_NET=0            =1 让 vLLM 走宿主机网络；代理只监听 127.0.0.1 时必须开
+  FAST=0                =1 开快速模式：并发 16 + 限像素 + 限 token
+  VL_CONCURRENCY=8      版面切块并发请求 VLM 的数量（官方默认串行，首要瓶颈）
+  MAX_PIXELS=           送进 VLM 的像素上限，如 1600000
   MODEL_SOURCE=modelscope  模型源 modelscope|aistudio|bos（境内直连）|huggingface（需境外代理）
   WORKERS=$WORKERS            API 并行流水线数
   DEVICE=$DEVICE         auto|cpu|gpu:0，版面分析设备
