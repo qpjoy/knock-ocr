@@ -24,7 +24,7 @@ PROXY="${PROXY:-}"                       # 出网代理，如 http://127.0.0.1:7
 HOST_NET="${HOST_NET:-0}"                # =1 让 vLLM 走宿主机网络（代理只监听 127.0.0.1 时必须开）
 MODEL_SOURCE="${MODEL_SOURCE:-modelscope}" # 模型源 modelscope|aistudio|bos|huggingface；前三个境内直连可达
 PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"  # 仅镜像缺依赖时才用到
-PROBE_TIMEOUT="${PROBE_TIMEOUT:-240}"    # GPU 探测单项超时，防止 import 卡死把 deploy 拖住
+PROBE_TIMEOUT="${PROBE_TIMEOUT:-120}"    # GPU 探测单项超时；正常十几秒，挂住的才等满
 
 REGISTRY="${REGISTRY:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle}"
 VLLM_IMAGE="${VLLM_IMAGE:-$REGISTRY/paddleocr-genai-vllm-server:latest-nvidia-gpu}"
@@ -550,11 +550,14 @@ cmd_deploy() {
 
 # 强制重来：额外丢掉探测缓存和自建镜像，但保留官方镜像与模型权重
 cmd_reset() {
-  say "重置：清掉容器、探测缓存、自建镜像"
+  say "重置：清掉容器和自建镜像，强制重建"
   docker rm -f "$C_API" "$C_VLLM" >/dev/null 2>&1 || true
   docker image rm "$API_IMAGE" >/dev/null 2>&1 || true
-  rm -f "$STATE/paddle_gpu" "$STATE/paddle_probe.log" "$STATE/torch_probe.log"
-  ok "已重置（官方镜像和模型权重都还在，不会重下）"
+  ok "已重置（官方镜像、模型权重、GPU 探测结果都保留）"
+  if [ -s "$STATE/paddle_gpu" ]; then
+    dim "  沿用已探测的版面分析设备：$(cat "$STATE/paddle_gpu")"
+    dim "  要重新探测：manage.sh gpucheck"
+  fi
   echo
   cmd_deploy
 }
