@@ -7,7 +7,12 @@
   GET  /healthz      就绪探针
   GET  /             Web 界面
 
-刻意只依赖官方镜像里已有的包（fastapi / uvicorn / starlette），
+引擎由 OCR_ENGINE 决定（见 engines.py）：
+  vl        PaddleOCR-VL + vLLM，服务器用
+  rapidocr  纯 CPU 轻量引擎，本地开发用
+两者对外接口完全一致，换引擎不动前端和调用方。
+
+刻意只依赖运行镜像里已有的包（fastapi / uvicorn / starlette），
 不引入 python-multipart —— 内网构建时 pip 可能出不去，多一个依赖就多一个卡点。
 """
 from __future__ import annotations
@@ -29,35 +34,20 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+from engines import get_engine
+
 APP_DIR = Path(__file__).parent
 STATIC = APP_DIR / "static"
 
-DEVICE = os.environ.get("OCR_DEVICE", "cpu")
-MODEL = os.environ.get("OCR_MODEL", "PaddleOCR-VL-1.6-0.9B")
-# backend 必须是 "vllm-server"（调用远端服务），不是 "vllm"（在本进程内自起引擎）。
-# 用 "vllm" 会让这个没有 GPU 的 API 容器自己去加载 0.9B 模型，然后无声卡死。
-# 依据是 genai_server 启动时打印的用法提示：
-#   --vl_rec_backend vllm-server --vl_rec_server_url http://localhost:8118/v1
-VL_BACKEND = os.environ.get("OCR_VL_BACKEND", "vllm-server")
-
-
-def _normalize_vllm_url(url: str) -> str:
-    """服务端要求带 /v1 后缀，统一补齐，避免配置漏写。"""
-    url = (url or "").rstrip("/")
-    if not url.endswith("/v1"):
-        url += "/v1"
-    return url
-
-
-VLLM_URL = _normalize_vllm_url(os.environ.get("OCR_VLLM_URL", "http://127.0.0.1:8118"))
-# VLLM_URL 已经以 /v1 结尾，探活地址只需再接 /models，别重复拼 /v1
-MODELS_URL = VLLM_URL + "/models"
+ENGINE = get_engine()
 WORKERS = int(os.environ.get("OCR_WORKERS", "4"))
 MAX_MB = int(os.environ.get("OCR_MAX_MB", "50"))
 # 单请求排队等流水线的上限；超时直接 503，避免请求堆积拖垮服务
 ACQUIRE_TIMEOUT = float(os.environ.get("OCR_ACQUIRE_TIMEOUT", "120"))
 
-ALLOWED = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".pdf"}
+ALLOWED = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+if ENGINE.supports_pdf:
+    ALLOWED = ALLOWED | {".pdf"}
 
 # 魔数比文件名可靠：粘贴上来的截图往往没有正经文件名
 MAGIC = (
@@ -121,7 +111,7 @@ def parse_upload(content_type: str, body: bytes) -> tuple[str, bytes]:
 
 # --------------------------------------------------------------- 流水线池
 class PipelinePool:
-    """预热 N 个 PaddleOCRVL 实例轮流用。
+    """预热 N 个引擎实例轮流用。
 
     实例本身不保证线程安全，所以用队列做独占借还，而不是共享单例。
     这也是后面换成多进程 / 多机 worker 时最自然的切分点。
@@ -134,27 +124,13 @@ class PipelinePool:
         self.error: str | None = None
         self._lock = threading.Lock()
 
-    def _build(self):
-        from paddleocr import PaddleOCRVL
-
-        kwargs = {
-            "vl_rec_backend": VL_BACKEND,
-            "vl_rec_server_url": VLLM_URL,
-            "vl_rec_api_model_name": MODEL,
-        }
-        if DEVICE:
-            kwargs["device"] = DEVICE
-        return PaddleOCRVL(**kwargs)
-
     def warmup(self):
-        print(f"[pool] 开始构建 {self.size} 条流水线  backend={VL_BACKEND}  "
-              f"url={VLLM_URL}  device={DEVICE}  model={MODEL}", flush=True)
+        print(f"[pool] 开始构建 {self.size} 条流水线  {ENGINE.describe()}", flush=True)
         for i in range(self.size):
             t0 = time.perf_counter()
-            print(f"[pool] 构建第 {i + 1}/{self.size} 条…"
-                  f"（首次要下载版面分析模型，可能要几分钟）", flush=True)
+            print(f"[pool] 构建第 {i + 1}/{self.size} 条…（首次可能要下载模型）", flush=True)
             try:
-                self._q.put(self._build())
+                self._q.put(ENGINE.build())
                 with self._lock:
                     self.ready += 1
                 print(f"[pool] 第 {i + 1}/{self.size} 条就绪"
@@ -223,62 +199,15 @@ class Metrics:
 METRICS = Metrics()
 
 
-# --------------------------------------------------------------- 结果提取
-def _markdown_of(res) -> str:
-    """PaddleOCR 各版本 markdown 返回形状不完全一致，按优先级兜底取。"""
-    m = getattr(res, "markdown", None)
-    if isinstance(m, str):
-        return m
-    if isinstance(m, dict):
-        for key in ("markdown_texts", "markdown_text", "text", "md"):
-            v = m.get(key)
-            if isinstance(v, str) and v.strip():
-                return v
-        parts = [v for v in m.values() if isinstance(v, str)]
-        if parts:
-            return "\n\n".join(parts)
-    return ""
-
-
-def _json_of(res) -> dict:
-    j = getattr(res, "json", None)
-    if callable(j):
-        try:
-            j = j()
-        except Exception:
-            j = None
-    if isinstance(j, dict):
-        return j.get("res", j)
-    return {}
-
-
-def _run(pipeline, path: str, merge_tables: bool) -> tuple[str, list, int]:
-    pages = list(pipeline.predict(path))
-
-    # 多页 PDF 走官方重组，跨页表格能接起来
-    if len(pages) > 1 and hasattr(pipeline, "restructure_pages"):
-        try:
-            merged = pipeline.restructure_pages(pages, merge_tables=merge_tables)
-            md = _markdown_of(merged)
-            if md:
-                return md, [_json_of(p) for p in pages], len(pages)
-        except Exception:
-            print("[warn] restructure_pages 失败，回落逐页拼接:\n"
-                  + traceback.format_exc(limit=3), flush=True)
-
-    md = "\n\n---\n\n".join(filter(None, (_markdown_of(p) for p in pages)))
-    return md, [_json_of(p) for p in pages], len(pages)
-
-
 # --------------------------------------------------------------- 应用
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # 后台预热：容器立刻可探活，界面能显示 "流水线 0/4 预热中"
+    # 后台预热：容器立刻可探活，界面能显示 "流水线 0/N 预热中"
     threading.Thread(target=POOL.warmup, daemon=True, name="pool-warmup").start()
     yield
 
 
-app = FastAPI(title="knock-ocr demo", version="0.1.0",
+app = FastAPI(title="knock-ocr demo", version="0.2.0",
               docs_url="/api/docs", lifespan=lifespan)
 
 
@@ -286,6 +215,7 @@ app = FastAPI(title="knock-ocr demo", version="0.1.0",
 def healthz():
     return {
         "ready": POOL.ready > 0,
+        "engine": ENGINE.name,
         "pool_ready": POOL.ready,
         "pool_size": POOL.size,
         "pool_idle": POOL.idle,
@@ -293,25 +223,36 @@ def healthz():
     }
 
 
-@app.get("/api/info")
-def info():
-    backend = {"url": VLLM_URL, "probe": MODELS_URL, "reachable": False, "models": []}
+def _backend_status() -> dict:
+    """只有 vl 引擎才有外部推理服务需要探活。"""
+    url = getattr(ENGINE, "server_url", None)
+    if not url:
+        return {"reachable": True, "note": "本引擎无外部依赖"}
+    probe = url.rstrip("/") + "/models"
+    out = {"url": url, "probe": probe, "reachable": False, "models": []}
     try:
         import urllib.request
 
-        with urllib.request.urlopen(MODELS_URL, timeout=10) as r:
+        with urllib.request.urlopen(probe, timeout=10) as r:
             data = json.loads(r.read().decode())
-            backend["reachable"] = True
-            backend["models"] = [m.get("id") for m in data.get("data", [])]
+            out["reachable"] = True
+            out["models"] = [m.get("id") for m in data.get("data", [])]
     except Exception as e:
-        backend["error"] = str(e)
+        out["error"] = str(e)
+    return out
 
+
+@app.get("/api/info")
+def info():
+    d = ENGINE.describe()
     return {
-        "model": MODEL,
-        "benchmark": "OmniDocBench v1.6 96.3%",
-        "layout_device": DEVICE,
-        "vl_backend": VL_BACKEND,
-        "vlm_backend": backend,
+        "engine": ENGINE.name,
+        "model": d.get("model", ENGINE.name),
+        "benchmark": "OmniDocBench v1.6 96.3%" if ENGINE.name == "vl" else "轻量 CPU 引擎",
+        "layout_device": d.get("layout_device", "cpu"),
+        "supports_pdf": ENGINE.supports_pdf,
+        "engine_detail": d,
+        "vlm_backend": _backend_status(),
         "workers": WORKERS,
         "pool": {"ready": POOL.ready, "idle": POOL.idle, "size": POOL.size},
         "metrics": METRICS.snapshot(),
@@ -352,7 +293,8 @@ async def ocr(
     suffix = sniff_suffix(blob, filename)
     if suffix not in ALLOWED:
         raise HTTPException(
-            415, f"无法识别的文件类型（文件名 {filename!r}）。支持：{sorted(ALLOWED)}")
+            415, f"当前引擎（{ENGINE.name}）不支持这个文件类型（{filename!r}）。"
+                 f"支持：{sorted(ALLOWED)}")
 
     t0 = time.perf_counter()
     ok = False
@@ -363,13 +305,14 @@ async def ocr(
             tmp = fh.name
 
         def work():
-            with POOL.acquire(ACQUIRE_TIMEOUT) as pipeline:
-                return _run(pipeline, tmp, merge_tables)
+            with POOL.acquire(ACQUIRE_TIMEOUT) as handle:
+                return ENGINE.run(handle, tmp, merge_tables)
 
         md, pages_json, npages = await run_in_threadpool(work)
         ok = True
         body = {
             "request_id": rid,
+            "engine": ENGINE.name,
             "filename": filename,
             "pages": npages,
             "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
@@ -381,9 +324,9 @@ async def ocr(
 
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
         print(f"[{rid}] 识别失败:\n{traceback.format_exc(limit=6)}", flush=True)
-        raise HTTPException(500, f"识别失败 (request_id={rid})")
+        raise HTTPException(500, f"识别失败 (request_id={rid}): {type(e).__name__}: {e}")
     finally:
         METRICS.record((time.perf_counter() - t0) * 1000, ok)
         if tmp:

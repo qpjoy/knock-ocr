@@ -8,7 +8,34 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Windows 的 Git Bash(MSYS) 会把 /app/x、/tmp/x 这类「容器内路径」自动改写成
+# Windows 路径，导致 docker run / cp / -v 全部错乱。这两行关掉该行为；
+# 在 Linux 上这两个变量没有任何作用，可以安全保留。
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL='*'
+
+# ---------------------------------------------------------------- 环境档
+# env/<name>.env 把一套环境的差异集中起来（本地 / 服务器）。
+# 命令行前缀优先级更高：档里的值只在变量未设置时才生效。
+#   PROFILE=local bash scripts/manage.sh deploy
+#   PROFILE=local PORT=9000 bash scripts/manage.sh deploy   # PORT 以命令行为准
+PROFILE="${PROFILE:-}"
+if [ -n "$PROFILE" ]; then
+  _pf="$ROOT/env/$PROFILE.env"
+  [ -f "$_pf" ] || { echo "找不到环境档 $_pf" >&2; exit 1; }
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in ''|'#'*) continue ;; esac
+    _line="${_line%$''}"          # 容忍 CRLF 结尾的档案文件
+    _k="${_line%%=*}"; _v="${_line#*=}"
+    _k="$(printf '%s' "$_k" | tr -d '[:space:]')"
+    [ -z "$_k" ] && continue
+    if [ -z "${!_k+x}" ]; then export "$_k=$_v"; fi
+  done < "$_pf"
+  echo "使用环境档：$PROFILE（$_pf）"
+fi
+
 # ---------------------------------------------------------------- 配置
+ENGINE="${ENGINE:-vl}"                   # vl = PaddleOCR-VL + vLLM(GPU)；rapidocr = 纯 CPU 轻量
 PROJECT="${PROJECT:-knock-ocr}"          # 容器/网络/卷名前缀，改它可并存多套
 GPU_ID="${GPU_ID:-2}"                    # 只占用这一张卡（默认避开挂显示器的 GPU3）
 PORT="${PORT:-8710}"                     # 对外 Web + API 端口；被占用会自动顺延
@@ -30,6 +57,9 @@ REGISTRY="${REGISTRY:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle}"
 VLLM_IMAGE="${VLLM_IMAGE:-$REGISTRY/paddleocr-genai-vllm-server:latest-nvidia-gpu}"
 BASE_IMAGE="${BASE_IMAGE:-$REGISTRY/paddleocr-vl:latest-nvidia-gpu}"
 API_IMAGE="${API_IMAGE:-$PROJECT/api:local}"
+if [ "$ENGINE" = "vl" ]; then API_DOCKERFILE="docker/api.Dockerfile"
+else API_DOCKERFILE="docker/local.Dockerfile"; fi
+uses_vllm() { [ "$ENGINE" = "vl" ]; }
 
 NET="${PROJECT}-net"
 C_VLLM="${PROJECT}-vllm"
@@ -53,7 +83,7 @@ rule() { printf '%s%s%s\n' "$c_dim" "──────────────�
 have() { command -v "$1" >/dev/null 2>&1; }
 container_state() { docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null || echo "absent"; }
 container_exit_code() { docker inspect -f '{{.State.ExitCode}}' "$1" 2>/dev/null || echo "?"; }
-http_ok() { curl -fsS -m 3 -o /dev/null "$1" 2>/dev/null; }
+http_ok() { curl -fsS -m 3 "$1" >/dev/null 2>&1; }
 
 port_busy() {
   if have ss;        then ss -ltn 2>/dev/null | grep -qE "[:.]$1[[:space:]]" && return 0
@@ -107,13 +137,19 @@ inherited_proxy() {
 # 生成测试图到宿主机路径 $1。
 # 不用 bind mount —— RHEL 上 SELinux + 容器内用户权限会导致写不进去（Errno 13）。
 # 改成容器内写 /tmp，再 docker cp 出来，零挂载零权限问题。
+# 关掉 MSYS 路径转换后，容器内路径对了，但宿主机路径（/e/foo）docker 又不认。
+# 这个函数在 Windows 上把它转回 E:/foo；Linux 上原样返回。
+hostpath() {
+  if have cygpath; then cygpath -m "$1"; else printf '%s' "$1"; fi
+}
+
 gen_sample() {
   local dst="$1" cid rc=0
   mkdir -p "$(dirname "$dst")"
   cid="$(docker create "$API_IMAGE" python /app/make_sample.py /tmp/sample.png)" || return 1
   docker start -a "$cid" || rc=$?
   if [ $rc -ne 0 ]; then docker rm -f "$cid" >/dev/null 2>&1; return 1; fi
-  docker cp "$cid:/tmp/sample.png" "$dst" >/dev/null || rc=$?
+  docker cp "$cid:/tmp/sample.png" "$(hostpath "$dst")" >/dev/null || rc=$?
   docker rm -f "$cid" >/dev/null 2>&1
   return $rc
 }
@@ -126,6 +162,9 @@ cmd_preflight() {
   docker info >/dev/null 2>&1 || die "docker 守护进程不可用（当前用户可能不在 docker 组）。"
   ok "docker 可用"
 
+  if ! uses_vllm; then
+    ok "引擎 $ENGINE：纯 CPU，不需要 GPU / 官方大镜像"
+  else
   have nvidia-smi || die "未找到 nvidia-smi"
   local ngpu; ngpu="$(nvidia-smi -L | wc -l | tr -d ' ')"
   nvidia-smi -i "$GPU_ID" >/dev/null 2>&1 || die "GPU $GPU_ID 不存在（本机共 $ngpu 张卡，编号 0..$((ngpu-1))）"
@@ -143,6 +182,7 @@ cmd_preflight() {
     ok "docker 已注册 nvidia runtime"
   else
     warn "docker info 里没看到 nvidia runtime，若 deploy 失败请检查 nvidia-container-toolkit"
+  fi
   fi
 
   # 端口：被自己的旧容器占着不算冲突（deploy 会先清掉）
@@ -175,7 +215,7 @@ cmd_preflight() {
   fi
 
   # docker 是否会往容器里硬塞代理变量 —— 指向 127.0.0.1 的话容器必然连不上
-  if docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1; then
+  if uses_vllm && docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1; then
     local inh; inh="$(inherited_proxy "$VLLM_IMAGE")"
     if [ -n "$inh" ]; then
       warn "docker 会向容器注入代理变量（来自 ~/.docker/config.json）："
@@ -190,7 +230,7 @@ cmd_preflight() {
   fi
 
   if [ -n "$PROXY" ]; then
-    if curl -fsS -m 5 -x "$PROXY" -o /dev/null https://www.baidu.com 2>/dev/null; then
+    if curl -fsS -m 5 -x "$PROXY" https://www.baidu.com >/dev/null 2>&1; then
       if [ "$HOST_NET" = "1" ]; then
         ok "代理可用：$PROXY（宿主机网络，容器内直接用同一地址）"
       else
@@ -297,6 +337,7 @@ ensure_net() {
 }
 
 cmd_pull() {
+  uses_vllm || { ok "轻量引擎（$ENGINE），不需要官方大镜像"; return 0; }
   say "确认官方镜像（已有则跳过，不会重复下载）"
   docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1 || docker pull "$VLLM_IMAGE"
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || docker pull "$BASE_IMAGE"
@@ -315,7 +356,7 @@ cmd_build() {
   fi
   docker build "${net[@]}" --build-arg "BASE_IMAGE=$BASE_IMAGE" \
     --build-arg "PIP_INDEX_URL=$PIP_INDEX_URL" \
-    -f docker/api.Dockerfile -t "$API_IMAGE" .
+    -f "$API_DOCKERFILE" -t "$API_IMAGE" .
   ok "API 镜像就绪：$API_IMAGE"
 }
 
@@ -362,6 +403,7 @@ start_api() {
     --restart unless-stopped \
     -p "$BIND:$PORT:8000" \
     "${extra[@]}" \
+    -e "OCR_ENGINE=$ENGINE" \
     -e "OCR_DEVICE=$dev" \
     -e "OCR_MODEL=$MODEL" \
     -e "OCR_VLLM_URL=$vurl" \
@@ -452,7 +494,11 @@ last_log_line() {
 
 wait_ready() {
   say "等待服务就绪"
-  dim "  两个阶段：① vLLM 下权重并加载模型  ② API 侧构建 $WORKERS 条流水线（要下版面模型）"
+  if uses_vllm; then
+    dim "  两个阶段：① vLLM 下权重并加载模型  ② API 侧构建 $WORKERS 条流水线（要下版面模型）"
+  else
+    dim "  轻量引擎（$ENGINE）：模型内置在镜像里，只需构建 $WORKERS 条流水线，通常几秒"
+  fi
   dim "  下面显示两者各自的状态，并实时跟随当前还没好的那个容器的日志。"
   dim "  完整日志：manage.sh logs vllm / manage.sh logs api"
   echo
@@ -467,7 +513,9 @@ wait_ready() {
       dim "  容器还活着，只是没就绪。看日志：manage.sh logs api / manage.sh logs vllm"
       return 1
     fi
-    for c in "$C_VLLM" "$C_API"; do
+    local watch_list="$C_API"
+    uses_vllm && watch_list="$C_VLLM $C_API"
+    for c in $watch_list; do
       if [ "$(container_state "$c")" != "running" ]; then
         printf '\r\033[K'; diagnose "$c"; return 1
       fi
@@ -484,8 +532,8 @@ wait_ready() {
     fi
 
     # 跟随「当前还没好的那个」的日志，别再一直盯着已经空闲的 vLLM
-    if [ "$vllm_up" = no ]; then watch="$C_VLLM"; stage="① vLLM 启动中"
-    else watch="$C_API"; stage="② API 构建流水线"; fi
+    if uses_vllm && [ "$vllm_up" = no ]; then watch="$C_VLLM"; stage="① vLLM 启动中"
+    else watch="$C_API"; stage="② 构建流水线"; fi
     line="$(last_log_line "$watch")"
     if [ "$line" = "$prev" ]; then stuck=$((stuck + 3)); else stuck=0; prev="$line"; fi
 
@@ -537,8 +585,11 @@ cmd_deploy() {
   cmd_build
   ensure_net
 
-  local dev; dev="$(resolve_device)"
-  start_vllm
+  local dev="cpu"
+  if uses_vllm; then
+    dev="$(resolve_device)"
+    start_vllm
+  fi
   start_api "$dev"
 
   if wait_ready; then
@@ -566,12 +617,16 @@ cmd_down()  { say "停止"; docker rm -f "$C_API" "$C_VLLM" >/dev/null 2>&1 || t
 cmd_up()    { cmd_deploy; }
 
 cmd_status() {
+  printf '  %-22s %s\n' "引擎"  "$ENGINE"
   printf '  %-22s %s\n' "项目"  "$PROJECT"
-  printf '  %-22s %s\n' "模型"  "$MODEL"
-  printf '  %-22s %s\n' "GPU"   "$GPU_ID"
+  if uses_vllm; then
+    printf '  %-22s %s\n' "模型"  "$MODEL"
+    printf '  %-22s %s\n' "GPU"   "$GPU_ID"
+  fi
   printf '  %-22s %s\n' "端口"  "$BIND:$PORT"
   [ -s "$STATE/paddle_gpu" ] && printf '  %-22s %s\n' "版面分析设备" "$(cat "$STATE/paddle_gpu")"
-  for c in "$C_VLLM" "$C_API"; do
+  local _cs="$C_API"; uses_vllm && _cs="$C_VLLM $C_API"
+  for c in $_cs; do
     local s; s="$(container_state "$c")"
     if [ "$s" = "running" ]; then printf '  %-22s %s%s%s\n' "$c" "$c_grn" "$s" "$c_off"
     else printf '  %-22s %s%s (exit=%s)%s\n' "$c" "$c_ylw" "$s" "$(container_exit_code "$c")" "$c_off"; fi
@@ -601,7 +656,8 @@ cmd_test() {
   fi
   say "识别 $f"
   local t0 t1; t0="$(date +%s%3N)"
-  curl -fsS -m 300 -F "file=@$f" "http://127.0.0.1:$PORT/api/ocr" -o "$STATE/result.json" \
+  curl -fsS -m 300 -F "file=@$(hostpath "$f")" \
+    "http://127.0.0.1:$PORT/api/ocr" -o "$(hostpath "$STATE")/result.json" \
     || die "请求失败，先看 bash scripts/manage.sh logs api"
   t1="$(date +%s%3N)"
   ok "完成，耗时 $((t1 - t0)) ms"
@@ -617,7 +673,7 @@ PY
 
 cmd_bench() {
   have python3 || die "需要 python3（只用标准库）"
-  python3 scripts/bench.py --url "http://127.0.0.1:$PORT/api/ocr" "$@"
+  PYTHONIOENCODING=utf-8 python3 scripts/bench.py --url "http://127.0.0.1:$PORT/api/ocr" "$@"
 }
 
 cmd_disk() {
@@ -714,7 +770,8 @@ for name, url in HOSTS:
 cmd_doctor() {
   rule
   say "1  容器状态"
-  for c in "$C_VLLM" "$C_API"; do
+  local _cs="$C_API"; uses_vllm && _cs="$C_VLLM $C_API"
+  for c in $_cs; do
     printf '    %-20s %s (exit=%s)\n' "$c" "$(container_state "$c")" "$(container_exit_code "$c")"
   done
 

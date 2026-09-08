@@ -4,11 +4,22 @@
 
 模型：`PaddleOCR-VL-1.6-0.9B` —— OmniDocBench v1.6 **96.3%**，当前文档解析榜首。
 
-## 一条命令
+## 两套环境，一条命令
+
+**服务器**（PaddleOCR-VL + vLLM，需要 GPU 和 20~30GB 官方镜像）：
 
 ```bash
-bash scripts/manage.sh deploy
+PROFILE=server bash scripts/manage.sh deploy
 ```
+
+**本地开发**（RapidOCR 纯 CPU，镜像不到 1GB，无需 GPU）：
+
+```bash
+PROFILE=local bash scripts/manage.sh deploy
+```
+
+两者跑的是**同一份 `app/` 代码、同一套 API、同一个界面**，只是引擎不同，
+所以本地改完逻辑可以直接同步到服务器。环境差异集中在 `env/*.env`。
 
 跑完打印访问地址。浏览器打开就能拖图识别，同一个能力也暴露为 HTTP API。
 
@@ -43,6 +54,8 @@ curl -F 'file=@page.png' http://<server>:8710/api/ocr
 | `GET /api/metrics` | 计数与 P50/P95/P99 |
 | `GET /healthz` | 就绪探针 |
 | `GET /api/docs` | 自动生成的 OpenAPI 文档 |
+
+引擎由 `OCR_ENGINE` 决定，响应里会带 `engine` 字段标明本次用的哪个。
 
 ## 文档
 

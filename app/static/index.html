@@ -69,7 +69,7 @@ button.copy{float:right;font-size:11.5px;padding:3px 10px;border:1px solid var(-
 <header>
   <h1>knock-ocr</h1>
   <span class="sub" id="modelName">加载中…</span>
-  <span class="badge">OmniDocBench v1.6 · 96.3%</span>
+  <span class="badge" id="benchBadge">—</span>
 </header>
 
 <div class="bar" id="statusBar"><span class="dot wait"></span>正在连接服务…</div>
@@ -163,6 +163,8 @@ async function poll(){
   try{
     const r = await fetch('/api/info'); const d = await r.json();
     $('#modelName').textContent = d.model + ' · 版面分析 ' + d.layout_device;
+    $('#benchBadge').textContent = d.benchmark || d.engine;
+    $('#benchBadge').title = 'engine=' + d.engine + (d.supports_pdf ? '（支持 PDF）' : '（仅图片）');
     const vlm = d.vlm_backend || {};
     const pool = d.pool || {};
     const m = d.metrics || {};
