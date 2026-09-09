@@ -790,6 +790,41 @@ print(json.dumps({k:v for k,v in d.items() if k not in ("markdown","result")},en
 PY
 }
 
+# 同一张图两个引擎各跑一遍，并排对比 —— 回答「这类图该用哪个引擎」
+cmd_compare() {
+  local f="${1:-}"
+  mkdir -p "$STATE"
+  if [ -z "$f" ]; then
+    say "未指定文件，生成一张测试图"
+    f="$STATE/sample.png"
+    gen_sample "$f" || die "生成失败；也可以自己指定：manage.sh compare <图片>"
+  fi
+  [ -f "$f" ] || die "文件不存在：$f"
+
+  local hp; hp="$(hostpath "$f")"
+  for e in fast quality; do
+    rule
+    say "engine=$e"
+    curl -fsS -m 600 -F "file=@$hp"       "http://127.0.0.1:$PORT/api/ocr?engine=$e&include_json=false"       -o "$(hostpath "$STATE")/cmp_$e.json" 2>/dev/null       || { warn "该引擎不可用或失败（本次部署 TIER=$TIER）"; continue; }
+    python3 - "$STATE/cmp_$e.json" <<'PY2'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+t = d.get("timings", {})
+print("  耗时   总 %sms  (接收 %s / 排队 %s / 推理 %s)  cached=%s"
+      % (d.get("elapsed_ms"), t.get("receive_ms"), t.get("queue_ms"),
+         t.get("infer_ms"), d.get("cached")))
+md = d.get("markdown") or ""
+print("  字符   %d" % len(md))
+print("  预览:")
+for line in md.splitlines()[:12]:
+    print("    " + line[:100])
+PY2
+  done
+  rule
+  dim "  完整结果：$STATE/cmp_fast.json  $STATE/cmp_quality.json"
+  dim "  看清差别的重点：金额里的逗号、表格结构、竖排/印章、多栏顺序"
+}
+
 cmd_bench() {
   have python3 || die "需要 python3（只用标准库）"
   PYTHONIOENCODING=utf-8 python3 scripts/bench.py --url "http://127.0.0.1:$PORT/api/ocr" "$@"
@@ -1009,6 +1044,7 @@ knock-ocr demo
   gpucheck      单独跑 GPU 探测：先查 vLLM(PyTorch) 再查 Paddle，各自给结论
   logs [api|vllm]
   test [文件]   端到端识别一次（不传文件则自动造一张）
+  compare [文件] 同一张图两个引擎各跑一遍，并排对比质量与耗时
   bench         并发压测，看 QPS / P50 / P95
   doctor        一次抓全所有诊断信息（卡住/报错时先跑这个）
   selftest      绕开本项目 API，用官方 CLI 在 vLLM 容器内直接识别一次
@@ -1067,6 +1103,7 @@ case "${1:-deploy}" in
   gpucheck) shift; cmd_gpucheck "$@" ;;
   logs)    shift; cmd_logs "$@" ;;
   test)    shift; cmd_test "$@" ;;
+  compare) shift; cmd_compare "$@" ;;
   bench)   shift; cmd_bench "$@" ;;
   stats)   shift; cmd_stats "$@" ;;
   disk)    shift; cmd_disk "$@" ;;
