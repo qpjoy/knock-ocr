@@ -99,6 +99,23 @@ details.tune[open]>summary{border-bottom:1px solid var(--line);color:var(--fg);f
 #usageCode{max-height:none}
 button.copy{float:right;font-size:11.5px;padding:3px 10px;border:1px solid var(--line);
   background:var(--panel);color:var(--dim);border-radius:6px;cursor:pointer}
+
+/* ---- 服务能力报告 ---- */
+.capgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+  gap:1px;background:var(--line);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.capcell{background:var(--panel);padding:13px 15px}
+.capcell .k{font-size:11px;color:var(--dim);margin-bottom:5px}
+.capcell .v{font-size:20px;font-weight:600;letter-spacing:-.02em;line-height:1.15;
+  font-variant-numeric:tabular-nums}
+.capcell .v small{font-size:12px;font-weight:400;color:var(--dim);margin-left:2px}
+.capcell .n{font-size:11px;color:var(--dim);margin-top:4px}
+.capnote{margin-top:12px;padding:12px 14px;background:var(--code);border-radius:8px;font-size:12.5px}
+.capnote b{font-weight:600}
+.capnote table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
+.capnote td{padding:5px 0;vertical-align:top;border-top:1px solid var(--line)}
+.capnote td:first-child{width:112px;color:var(--dim);white-space:nowrap;padding-right:10px}
+.capnote tr:first-child td{border-top:0}
+.capwarn{color:var(--warn)}
 </style>
 </head>
 <body>
@@ -107,7 +124,7 @@ button.copy{float:right;font-size:11.5px;padding:3px 10px;border:1px solid var(-
 <header>
   <h1>knock-ocr</h1>
   <span class="sub" id="modelName">加载中…</span>
-  <span class="badge">OmniDocBench v1.6 · 96.3%</span>
+  <span class="badge" id="benchBadge">OmniDocBench v1.6 · 96.3%</span>
 </header>
 
 <div class="bar" id="statusBar"><span class="dot wait"></span>正在连接服务…</div>
@@ -184,6 +201,14 @@ button.copy{float:right;font-size:11.5px;padding:3px 10px;border:1px solid var(-
   <div class="pane" id="pane-json" hidden><button class="copy" data-c="json">复制</button><pre id="jsonText"></pre></div>
   <div class="meta" id="meta"></div>
 </div>
+
+<details class="tune" id="cap" open>
+  <summary>服务能力 <span style="font-weight:400" id="capSummary">· 给团队看</span></summary>
+  <div class="tunebody">
+    <div class="capgrid" id="capGrid"></div>
+    <div class="capnote" id="capOverflow"></div>
+  </div>
+</details>
 
 <details class="tune" id="usage" open>
   <summary>接口用法 <span style="font-weight:400">· 爬虫接入看这里</span></summary>
@@ -451,9 +476,57 @@ function tuneQuery(){
 }
 
 /* ---------- 状态 ---------- */
+// 「服务能力」那块报告。数字全部来自服务端实时状态 + 部署时传进来的实际配额，
+// 不在前端写死，免得改了部署参数界面还挂着旧承诺。
+function paintCapacity(d){
+  const c = d.capacity || {}, jobs = d.jobs || {};
+  const cores = c.cpu_limit && c.host_cpus
+      ? `${c.cpu_limit}<small>/${c.host_cpus} 核</small>` : '—';
+  const gpu = c.gpu_id !== '' && c.gpu_id != null
+      ? `GPU ${c.gpu_id}<small> · 1 张</small>` : `不用<small> GPU</small>`;
+  const rps = c.rated_rps || 0;
+  const daily = rps ? (rps * 86400 * 0.5 / 10000).toFixed(0) : '—';
+
+  $('#capGrid').innerHTML = [
+    ['建议并发', `${c.rated_concurrency||'—'}`, '实测拐点，调用方按这个限流'],
+    ['该并发下吞吐', `${rps||'—'}<small>req/s</small>`, `约 ${daily} 万图/天（按半天满载）`],
+    ['CPU 占用', cores, c.cpuset ? `绑核 ${c.cpuset}` : '时间片配额，空闲时不占'],
+    ['内存上限', `${c.mem_limit||'—'}`, c.host_mem_gb ? `整机 ${c.host_mem_gb}G` : ''],
+    ['显卡占用', gpu, `整机 4 张，只用 1 张`],
+    ['流水线', `${c.pipelines_total||'—'}`, `${c.uvicorn_workers||'?'} 进程 × 每进程 ${
+        ((d.pools||{})[ENGINE]||{}).size || '?'} 条`],
+  ].map(([k,v,n]) =>
+    `<div class="capcell"><div class="k">${k}</div><div class="v">${v}</div>` +
+    (n ? `<div class="n">${n}</div>` : '') + `</div>`).join('');
+
+  // 超量怎么处理 —— 两个端点的行为完全不同，写清楚免得爬虫那边猜。
+  const pend = jobs.pending || 0, capn = jobs.capacity || 0;
+  const busy = capn && pend / capn > 0.8;
+  $('#capOverflow').innerHTML =
+    `<b>爬虫量超了会怎样</b>` +
+    `<table><tbody>` +
+    `<tr><td>同步接口</td><td><code>/api/ocr</code> 没有队列。流水线占满后新请求<b>排队等</b>，` +
+      `不丢也不拒——所以超量表现为延迟变长，不是报错。压到远超 ${c.rated_concurrency||24} 时延迟会明显劣化。</td></tr>` +
+    `<tr><td>异步接口</td><td><code>/api/ocr/async</code> 进队列，深度 <b>${capn||'—'}</b>，` +
+      `${jobs.workers||'—'} 个消费线程。<b>队满直接返 429</b>，这是明确的背压信号：` +
+      `请退避重试，别原地重发。结果保留 ${Math.round((jobs.ttl_s||0)/60)} 分钟。</td></tr>` +
+    `<tr><td>当前队列</td><td class="${busy?'capwarn':''}"><b>${pend}</b> / ${capn||'—'} 待处理` +
+      (busy ? ' · 已超八成，接近背压' : '') + `</td></tr>` +
+    `<tr><td>建议做法</td><td>大批量走异步接口 + 收到 429 就退避；` +
+      `重复图很多的话缓存会直接命中，比推理快两个数量级。</td></tr>` +
+    `</tbody></table>`;
+
+  $('#capSummary').textContent =
+    `· 建议并发 ${c.rated_concurrency||'—'} → ${rps||'—'} req/s`;
+}
+
 async function poll(){
   try{
     const r = await fetch('/api/info'); const d = await r.json();
+    // JSON 解析成功 = 服务确实答话了。lastOk 记的是「连得上」，不是「渲染成功」——
+    // 放在函数末尾的话，下面任何一处渲染报错都会被误报成「连接服务失败」，
+    // 让人去查一个根本不存在的网络问题。（真踩过：一个写错的 id 害我查了半天。）
+    lastOk = Date.now();
     AVAILABLE = Object.keys(d.engines || {});
     if(ENGINE === null){
       let saved = null; try{ saved = localStorage.getItem('knock-ocr-engine'); }catch(_){}
@@ -485,13 +558,14 @@ async function poll(){
     $('#statusBar').innerHTML =
       (needVlm
         ? `<span><span class="dot ${vlm.reachable?'on':'off'}"></span>VLM 后端 <b>${vlm.reachable?'在线':'离线'}</b></span>`
-        : `<span><span class="dot on"></span><b>纯 CPU</b>，无外部依赖</span>`) +
+        : `<span><span class="dot on"></span><b>${
+            eng.device === 'cuda' ? 'GPU 直连' : '纯 CPU'}</b>，无外部依赖</span>`) +
       `<span><span class="dot ${p.ready>0?'on':'wait'}"></span>流水线 <b>${p.ready||0}/${p.size||0}</b>（空闲 ${p.idle||0}）</span>` +
       `<span>累计 <b>${m.total||0}</b> 次` + (m.failed ? ` · 失败 ${m.failed}` : '') + `</span>` +
       (m.p50_ms ? `<span>P50 <b>${m.p50_ms}</b>ms · P95 <b>${m.p95_ms}</b>ms</span>` : '') +
       (cache.enabled ? `<span title="sha256 内容寻址去重">缓存 <b>${cache.size}</b>/${cache.capacity}` +
         (cache.hit_rate != null ? ` · 命中 <b>${(cache.hit_rate*100).toFixed(0)}%</b>` : '') + `</span>` : '');
-    lastOk = Date.now();
+    paintCapacity(d);
   }catch(e){
     // 一次轮询失败不该把状态整个抹掉 —— 服务通常还好好的，
     // 只是这一次请求超时/被挤掉了。保留上次数据，角落里提示一下。

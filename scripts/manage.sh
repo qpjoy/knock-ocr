@@ -53,7 +53,21 @@ _HOST_CPUS="$(nproc 2>/dev/null || echo 8)"
 _HOST_MEM_GB="$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 16)"
 # CPU 是「时间片配额」：空闲时一点不占，超限只是被限速，不会让别的程序用不了。
 # 所以按机器比例给是合理的。
-CPU_LIMIT="${CPU_LIMIT:-$(( _HOST_CPUS / 4 > 4 ? _HOST_CPUS / 4 : 4 ))}"   # 默认 1/4 核数，至少 4
+# fast-gpu 的进程数固定 4：单卡上每进程一个 CUDA context，是时间片轮转不是并行，
+# 加进程是负收益（实测 8 进程 4.52 req/s，4 进程 7.02）。
+_UW_GPU=4
+if [ "$TIER" = "fast-gpu" ]; then
+  # GPU 档的 CPU 需求可以精确算出来，不用拍脑袋：满载时的 ONNX 线程总数
+  #   进程数 × 每进程流水线数 × 单次推理线程数 = 4 × WORKERS_FAST × ORT_INTRA
+  # 默认 4×4×4 = 64。给少了是线程超订 —— 实测 32 核比 64 核低 31%，
+  # 那 31% 不是"多给了资源"，就是把超订消掉而已。给多了也用不上。
+  # 想缩小占用就连流水线一起降（WORKERS_FAST=2 会自动算出 32 核），
+  # 别只降 CPU_LIMIT 不降流水线，那是最差的组合。
+  CPU_LIMIT="${CPU_LIMIT:-$(( _UW_GPU * WORKERS_FAST * ORT_INTRA ))}"
+  [ "$CPU_LIMIT" -gt "$_HOST_CPUS" ] && CPU_LIMIT="$_HOST_CPUS"
+else
+  CPU_LIMIT="${CPU_LIMIT:-$(( _HOST_CPUS / 4 > 4 ? _HOST_CPUS / 4 : 4 ))}"   # 默认 1/4 核数，至少 4
+fi
 # CPUSET 是物理绑核（--cpuset-cpus），比 CPU_LIMIT 更硬：容器只能跑在这些核上，
 # 而且在 128 核这种多 NUMA 机器上还顺带拿到访存局部性。默认不绑。
 #   CPUSET=0-31   只用 0~31 号核
@@ -68,9 +82,7 @@ esac
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.35}"     # vLLM 占这张卡的显存比例，剩下留给别人
 # API 进程数默认按 CPU 配额推：配额 / 单次推理线程数
 if [ "$TIER" = "fast-gpu" ]; then
-  # 推理搬到显卡后 CPU 侧只剩前后处理，进程数不必再按核数推 ——
-  # 开多了只是多占显存。4 个足够喂饱一张卡，压测后再按实测调。
-  UVICORN_WORKERS="${UVICORN_WORKERS:-4}"
+  UVICORN_WORKERS="${UVICORN_WORKERS:-$_UW_GPU}"
 else
   UVICORN_WORKERS="${UVICORN_WORKERS:-$(( CPU_LIMIT / OMP_THREADS > 1 ? CPU_LIMIT / OMP_THREADS : 1 ))}"
 fi
@@ -81,6 +93,11 @@ JOB_WORKERS="${JOB_WORKERS:-4}"          # 异步队列消费线程数
 JOB_QUEUE_MAX="${JOB_QUEUE_MAX:-1000}"   # 队列深度，满了返回 429（明确背压）
 JOB_TTL="${JOB_TTL:-1800}"               # 任务结果保留秒数
 FETCH_ALLOW_HOSTS="${FETCH_ALLOW_HOSTS:-}"  # url 传参的域名白名单，空=不限
+# 实测额定值，只用来在界面上给团队看，不影响运行。
+# 当前值测自：fast-gpu / 4 进程 × 4 流水线 / 64 核 / 并发 24 / 200 请求 / 零失败。
+# 换了配置就要重测并改这里，别让界面挂着一个过期的承诺。
+RATED_CONCURRENCY="${RATED_CONCURRENCY:-24}"   # 调用方该用的并发（实测拐点）
+RATED_RPS="${RATED_RPS:-24.8}"                 # 该并发下的实测吞吐
                                          # 爬虫重复图多，命中率 30~60%，直接抬高有效吞吐
 PROJECT="${PROJECT:-knock-ocr}"          # 容器/网络/卷名前缀，改它可并存多套
 GPU_ID="${GPU_ID:-2}"                    # 只占用这一张卡（默认避开挂显示器的 GPU3）
@@ -312,6 +329,13 @@ cmd_preflight() {
     warn "未设 CPU/内存上限，可能挤占这台机器上的其他服务"
   fi
   uses_vllm && dim "      vLLM 显存比例 GPU_MEM_UTIL=$GPU_MEM_UTIL（其余留给别人）"
+  if [ "$TIER" = "fast-gpu" ]; then
+    ok "额定能力：并发 $RATED_CONCURRENCY → $RATED_RPS req/s（$UVICORN_WORKERS 进程 × $WORKERS_FAST 条流水线）"
+    if [ "$WORKERS_FAST" -gt 4 ]; then
+      warn "WORKERS_FAST=$WORKERS_FAST 实测会撑爆显存：32 条流水线时约 1/4 请求返回 500"
+      dim "      报错形如 BFCArena ... Failed to allocate memory。32GB 单卡上别超 4。"
+    fi
+  fi
 
   if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
     if firewall-cmd --query-port="$PORT/tcp" >/dev/null 2>&1; then
@@ -622,6 +646,14 @@ start_api() {
     -e "OCR_JOB_TTL=$JOB_TTL" \
     -e "OCR_FETCH_ALLOW_HOSTS=$FETCH_ALLOW_HOSTS" \
     -e "UVICORN_WORKERS=$UVICORN_WORKERS" \
+    -e "OCR_CPU_LIMIT=$CPU_LIMIT" \
+    -e "OCR_MEM_LIMIT=$MEM_LIMIT" \
+    -e "OCR_CPUSET=$CPUSET" \
+    -e "OCR_HOST_CPUS=$_HOST_CPUS" \
+    -e "OCR_HOST_MEM_GB=$_HOST_MEM_GB" \
+    -e "OCR_GPU_ID=$(needs_gpu && printf '%s' "$GPU_ID")" \
+    -e "OCR_RATED_CONCURRENCY=$RATED_CONCURRENCY" \
+    -e "OCR_RATED_RPS=$RATED_RPS" \
     -e "OMP_NUM_THREADS=$OMP_THREADS" \
     -e "OCR_ORT_INTRA_THREADS=$ORT_INTRA" \
     -e "OCR_FAST_CUDA=$FAST_CUDA" \

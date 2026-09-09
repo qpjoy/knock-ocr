@@ -61,6 +61,31 @@ JOB_QUEUE_MAX = int(os.environ.get("OCR_JOB_QUEUE_MAX", "1000"))  # 队列深度
 JOB_WORKERS = int(os.environ.get("OCR_JOB_WORKERS", "4"))         # 队列消费线程数
 JOB_TTL = int(os.environ.get("OCR_JOB_TTL", "1800"))              # 结果保留秒数
 
+# ---- 界面上那份「服务能力」报告用的数据 ----
+# 资源占用由 manage.sh 在启动时传进来（docker 的 --cpus/--memory 是容器外的东西，
+# 进程自己看不到真实配额，只能靠传）。额定吞吐是实测值，换配置要重测。
+
+
+def _int_env(name: str, default: int = 0) -> int:
+    try:
+        return int(float(os.environ.get(name) or default))
+    except ValueError:
+        return default
+
+
+CAPACITY = {
+    "cpu_limit": _int_env("OCR_CPU_LIMIT"),
+    "host_cpus": _int_env("OCR_HOST_CPUS"),
+    "mem_limit": os.environ.get("OCR_MEM_LIMIT", ""),
+    "host_mem_gb": _int_env("OCR_HOST_MEM_GB"),
+    "cpuset": os.environ.get("OCR_CPUSET", ""),
+    "gpu_id": os.environ.get("OCR_GPU_ID", ""),
+    "uvicorn_workers": _int_env("UVICORN_WORKERS", 1),
+    "ort_intra": _int_env("OCR_ORT_INTRA_THREADS", 4),
+    "rated_concurrency": _int_env("OCR_RATED_CONCURRENCY", 24),
+    "rated_rps": float(os.environ.get("OCR_RATED_RPS") or 24.8),
+}
+
 
 def _num_env(name, cast=int):
     v = os.environ.get(name, "").strip()
@@ -665,6 +690,11 @@ def info():
         "cache": CACHE.snapshot(),
         "jobs": {"pending": JOBS.pending, "workers": JOBS.workers,
                  "capacity": JOBS.capacity, "ttl_s": JOBS.ttl},
+        # 流水线总数 = 进程数 × 每进程池子大小。pools 只反映当前这个进程，
+        # 界面要展示的是整个服务的规模，所以在这里乘一次。
+        "capacity": dict(CAPACITY, pipelines_total=(
+            CAPACITY["uvicorn_workers"]
+            * max((p.get("size") or 0) for p in pools.values()) if pools else 0)),
     }
 
 
