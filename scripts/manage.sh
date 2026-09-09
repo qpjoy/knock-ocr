@@ -28,8 +28,17 @@ OMP_THREADS="${OMP_THREADS:-4}"          # 单次推理的线程数上限
 # 都可以覆盖。想吃满就传 CPU_LIMIT=0 MEM_LIMIT=0（不推荐）。
 _HOST_CPUS="$(nproc 2>/dev/null || echo 8)"
 _HOST_MEM_GB="$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 16)"
+# CPU 是「时间片配额」：空闲时一点不占，超限只是被限速，不会让别的程序用不了。
+# 所以按机器比例给是合理的。
 CPU_LIMIT="${CPU_LIMIT:-$(( _HOST_CPUS / 4 > 4 ? _HOST_CPUS / 4 : 4 ))}"   # 默认 1/4 核数，至少 4
-MEM_LIMIT="${MEM_LIMIT:-$(( _HOST_MEM_GB / 4 > 4 ? _HOST_MEM_GB / 4 : 4 ))}g"  # 默认 1/4 内存，至少 4g
+# CPUSET 是物理绑核（--cpuset-cpus），比 CPU_LIMIT 更硬：容器只能跑在这些核上，
+# 而且在 128 核这种多 NUMA 机器上还顺带拿到访存局部性。默认不绑。
+#   CPUSET=0-31   只用 0~31 号核
+CPUSET="${CPUSET:-}"
+# 内存和 CPU 不同：超限是直接 OOM Kill，不是限速；而且已分配的不会自动归还。
+# 所以要按「实际峰值 + 余量」给，不能按机器比例拍 —— 给太小会被杀。
+# 实测量级：fast 每 worker 几百 MB；quality 侧 vLLM 加载期host 内存会冲高。
+if [ "$TIER" = "fast" ]; then MEM_LIMIT="${MEM_LIMIT:-16g}"; else MEM_LIMIT="${MEM_LIMIT:-48g}"; fi
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.35}"     # vLLM 占这张卡的显存比例，剩下留给别人
 # API 进程数默认按 CPU 配额推：配额 / 单次推理线程数
 UVICORN_WORKERS="${UVICORN_WORKERS:-$(( CPU_LIMIT / OMP_THREADS > 1 ? CPU_LIMIT / OMP_THREADS : 1 ))}"
@@ -178,6 +187,7 @@ limit_args() {
   local a=()
   [ "${CPU_LIMIT:-0}" != "0" ] && a+=(--cpus "$CPU_LIMIT")
   [ "${MEM_LIMIT:-0}" != "0" ] && [ "${MEM_LIMIT}" != "0g" ] && a+=(--memory "$MEM_LIMIT")
+  [ -n "${CPUSET:-}" ] && a+=(--cpuset-cpus "$CPUSET")
   [ ${#a[@]} -gt 0 ] && printf '%s
 ' "${a[@]}"
   return 0
@@ -250,6 +260,7 @@ cmd_preflight() {
   if [ "${CPU_LIMIT:-0}" != "0" ]; then
     ok "资源配额：CPU ${CPU_LIMIT} 核 / 内存 ${MEM_LIMIT} / API 进程 ${UVICORN_WORKERS}（宿主机共 ${_HOST_CPUS} 核 ${_HOST_MEM_GB}G）"
     dim "      想多给：CPU_LIMIT=64 MEM_LIMIT=64g bash scripts/manage.sh deploy"
+    [ -n "${CPUSET:-}" ] && ok "物理绑核：$CPUSET（容器只能跑在这些核上）"       || dim "      要物理隔离可绑核：CPUSET=0-31 bash scripts/manage.sh deploy"
   else
     warn "未设 CPU/内存上限，可能挤占这台机器上的其他服务"
   fi
@@ -995,6 +1006,7 @@ knock-ocr demo
   doctor        一次抓全所有诊断信息（卡住/报错时先跑这个）
   selftest      绕开本项目 API，用官方 CLI 在 vLLM 容器内直接识别一次
   netcheck      在容器里测能不能连上模型源（连不上模型时先跑这个）
+  stats         实际占用 vs 配额上限（CPU/内存/GPU）
   disk          镜像与模型缓存占了多少盘
   server-help   查看 genai_server 支持哪些参数（模型名对不对看这个）
   clean         删掉容器/网络/自建镜像（模型权重保留）
@@ -1005,6 +1017,17 @@ knock-ocr demo
   BIND=$BIND        只本机访问传 127.0.0.1
   PROXY=                出网代理，如 http://127.0.0.1:7788（下模型权重用）
   HOST_NET=0            =1 让 vLLM 走宿主机网络；代理只监听 127.0.0.1 时必须开
+  TIER=full             部署档 fast|quality|full
+                        fast    只装 PP-OCRv6(ONNX)，镜像 <1GB，不要 GPU
+                        quality 只装 PaddleOCR-VL + vLLM
+                        full    两个都装，调用时 ?engine=fast|quality 自选
+  DEFAULT_ENGINE=       full 档下不带 engine 参数时走哪个（默认 fast）
+  CPU_LIMIT=<核数/4>    CPU 时间片配额。空闲不占，超限只限速，不会挤到别人。0=不限
+  MEM_LIMIT=16g|48g     内存硬上限。超限直接 OOM Kill，按峰值+余量给，别抠
+  CPUSET=               物理绑核，如 0-31。比配额更硬，NUMA 机器还有访存局部性收益
+  GPU_MEM_UTIL=0.35     vLLM 占该卡显存的比例，其余留给别人
+  UVICORN_WORKERS=      API 进程数，默认按 CPU 配额推算
+  CACHE_SIZE=512        sha256 内容寻址缓存条数；0=关闭
   FAST=0                =1 开快速模式：并发 16 + 限像素 + 限 token
   VL_CONCURRENCY=8      版面切块并发请求 VLM 的数量（官方默认串行，首要瓶颈）
   MAX_PIXELS=           送进 VLM 的像素上限，如 1600000
@@ -1033,6 +1056,7 @@ case "${1:-deploy}" in
   logs)    shift; cmd_logs "$@" ;;
   test)    shift; cmd_test "$@" ;;
   bench)   shift; cmd_bench "$@" ;;
+  stats)   shift; cmd_stats "$@" ;;
   disk)    shift; cmd_disk "$@" ;;
   pull)    shift; cmd_pull "$@" ;;
   build)   shift; cmd_build "$@" ;;
