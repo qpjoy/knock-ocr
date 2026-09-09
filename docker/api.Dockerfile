@@ -32,7 +32,7 @@ RUN if [ "$WITH_FAST" = "1" ]; then \
     else \
         echo "WITH_FAST=0，跳过 fast 引擎"; \
     fi; \
-    rm -f /tmp/install_fast_engine.sh
+    rm -f /tmp/install_fast_engine.sh 2>/dev/null || true
 
 WORKDIR /app
 COPY app/ /app/

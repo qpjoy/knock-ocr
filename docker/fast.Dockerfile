@@ -17,7 +17,8 @@ RUN python -m pip install --no-cache-dir -i "$PIP_INDEX_URL" \
         "fastapi>=0.110" "uvicorn[standard]>=0.29" "pillow>=10.0"
 
 COPY docker/install_fast_engine.sh /tmp/install_fast_engine.sh
-RUN sh /tmp/install_fast_engine.sh "$PIP_INDEX_URL" && rm -f /tmp/install_fast_engine.sh
+RUN sh /tmp/install_fast_engine.sh "$PIP_INDEX_URL" \
+ && (rm -f /tmp/install_fast_engine.sh 2>/dev/null || true)
 
 WORKDIR /app
 COPY app/ /app/
