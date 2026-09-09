@@ -22,12 +22,19 @@ TIER="${TIER:-fast-gpu}"                 # 部署档：fast | fast-gpu | quality
                                          #   quality  只装 PaddleOCR-VL + vLLM
                                          #   full     fast(CPU) + quality 都装，接口用 ?engine= 选
 DEFAULT_ENGINE="${DEFAULT_ENGINE:-}"     # full 档下 /api/ocr 不带 engine 时走哪个，默认 fast
-# 快通道每进程的流水线数。CPU 档和 GPU 档的含义完全不同：
-#   fast     一条流水线 = 一份 CPU 线程预算，多开才能把核吃满
-#   fast-gpu 一条流水线 = 三个常驻的 CUDA session（det/rec/cls），每个都会
-#            自己预留显存 arena。按 CPU 档的 8 条 × 8 进程开下去就是 192 个
-#            CUDA session，32GB 显存直接吃干。显卡本来就串行，够喂饱即可。
-if [ "$TIER" = "fast-gpu" ]; then WORKERS_FAST="${WORKERS_FAST:-1}"; else WORKERS_FAST="${WORKERS_FAST:-8}"; fi
+# 快通道每进程的流水线数。CPU 档和 GPU 档的调法方向相反，别照搬：
+#   fast     一条流水线 = 一份 CPU 线程预算，靠多进程吃满核
+#   fast-gpu 要反过来压进程数、加每进程的流水线数。单卡上多个进程 = 多个
+#            CUDA context，是时间片轮转不是并行，加进程纯付切换成本。
+#
+# 实测（并发 16，n=200，CPU 配额 32 核）：
+#   进程4×流水线1 =  4 条   7.02 req/s
+#   进程8×流水线1 =  8 条   4.52 req/s   context 翻倍 -> 掉到三分之一
+#   进程4×流水线2 =  8 条  10.58 req/s
+#   进程4×流水线4 = 16 条  14.73 req/s   全成功
+#   进程4×流水线8 = 32 条    ——          52/200 请求 HTTP 500
+# 4 是目前跑满且零失败的最大值。想再往上要先查清 8 为什么会 500。
+if [ "$TIER" = "fast-gpu" ]; then WORKERS_FAST="${WORKERS_FAST:-4}"; else WORKERS_FAST="${WORKERS_FAST:-8}"; fi
 # 单次 ONNX/Paddle 推理会吃满 CPU，靠并发请求提不了吞吐 ——
 # 必须「每次推理只用少量线程 + 多进程」才能把多核吃满。128 核机器尤其明显。
 OMP_THREADS="${OMP_THREADS:-4}"          # 单次推理的线程数上限
