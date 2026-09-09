@@ -22,8 +22,17 @@ DEFAULT_ENGINE="${DEFAULT_ENGINE:-}"     # full 档下 /api/ocr 不带 engine �
 WORKERS_FAST="${WORKERS_FAST:-8}"        # 快通道每进程的流水线数
 # 单次 ONNX/Paddle 推理会吃满 CPU，靠并发请求提不了吞吐 ——
 # 必须「每次推理只用少量线程 + 多进程」才能把多核吃满。128 核机器尤其明显。
-UVICORN_WORKERS="${UVICORN_WORKERS:-1}"  # API 进程数；fast 档吃 CPU，按核数调大
 OMP_THREADS="${OMP_THREADS:-4}"          # 单次推理的线程数上限
+
+# ---- 资源占用上限：这台机器还跑着别的服务，默认只吃一小部分 ----
+# 都可以覆盖。想吃满就传 CPU_LIMIT=0 MEM_LIMIT=0（不推荐）。
+_HOST_CPUS="$(nproc 2>/dev/null || echo 8)"
+_HOST_MEM_GB="$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 16)"
+CPU_LIMIT="${CPU_LIMIT:-$(( _HOST_CPUS / 4 > 4 ? _HOST_CPUS / 4 : 4 ))}"   # 默认 1/4 核数，至少 4
+MEM_LIMIT="${MEM_LIMIT:-$(( _HOST_MEM_GB / 4 > 4 ? _HOST_MEM_GB / 4 : 4 ))}g"  # 默认 1/4 内存，至少 4g
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.35}"     # vLLM 占这张卡的显存比例，剩下留给别人
+# API 进程数默认按 CPU 配额推：配额 / 单次推理线程数
+UVICORN_WORKERS="${UVICORN_WORKERS:-$(( CPU_LIMIT / OMP_THREADS > 1 ? CPU_LIMIT / OMP_THREADS : 1 ))}"
 CACHE_SIZE="${CACHE_SIZE:-512}"          # 内容寻址缓存条数（sha256 去重）；0=关闭
                                          # 爬虫重复图多，命中率 30~60%，直接抬高有效吞吐
 PROJECT="${PROJECT:-knock-ocr}"          # 容器/网络/卷名前缀，改它可并存多套
@@ -37,6 +46,8 @@ WORKERS="${WORKERS:-4}"                  # API 侧并行流水线数
 DEVICE="${DEVICE:-auto}"                 # auto | cpu | gpu:0  —— Paddle 侧（版面分析）跑在哪
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-2400}"     # 等服务就绪的秒数（首次要下模型，给足）
 VLLM_ARGS="${VLLM_ARGS:-}"               # 透传给 genai_server 的额外参数
+                                         # 显存比例见 GPU_MEM_UTIL；若本版本 genai_server
+                                         # 不认该参数，用 manage.sh server-help 查真实参数名
 PROXY="${PROXY:-}"                       # 出网代理，如 http://127.0.0.1:7788（下模型权重要用）
 HOST_NET="${HOST_NET:-0}"                # =1 让 vLLM 走宿主机网络（代理只监听 127.0.0.1 时必须开）
 MODEL_SOURCE="${MODEL_SOURCE:-modelscope}" # 模型源 modelscope|aistudio|bos|huggingface；前三个境内直连可达
@@ -162,6 +173,16 @@ ensure_volume_perms() {
   docker run --rm --user 0:0 --entrypoint sh -v "$vol":/vol "$img"     -c "chown -R $ug /vol 2>/dev/null; chmod -R a+rwX /vol 2>/dev/null; true" >/dev/null 2>&1 || true
 }
 
+# 容器资源上限。CPU_LIMIT=0 / MEM_LIMIT=0 表示不限（不推荐，会挤占别的服务）。
+limit_args() {
+  local a=()
+  [ "${CPU_LIMIT:-0}" != "0" ] && a+=(--cpus "$CPU_LIMIT")
+  [ "${MEM_LIMIT:-0}" != "0" ] && [ "${MEM_LIMIT}" != "0g" ] && a+=(--memory "$MEM_LIMIT")
+  [ ${#a[@]} -gt 0 ] && printf '%s
+' "${a[@]}"
+  return 0
+}
+
 # 关掉 MSYS 路径转换后，宿主机路径（/e/foo）docker 不认；
 # 这个函数在 Windows 上转回 E:/foo，Linux 上原样返回。
 hostpath() {
@@ -226,6 +247,13 @@ cmd_preflight() {
     fi
   fi
   ok "对外端口 $PORT"
+  if [ "${CPU_LIMIT:-0}" != "0" ]; then
+    ok "资源配额：CPU ${CPU_LIMIT} 核 / 内存 ${MEM_LIMIT} / API 进程 ${UVICORN_WORKERS}（宿主机共 ${_HOST_CPUS} 核 ${_HOST_MEM_GB}G）"
+    dim "      想多给：CPU_LIMIT=64 MEM_LIMIT=64g bash scripts/manage.sh deploy"
+  else
+    warn "未设 CPU/内存上限，可能挤占这台机器上的其他服务"
+  fi
+  uses_vllm && dim "      vLLM 显存比例 GPU_MEM_UTIL=$GPU_MEM_UTIL（其余留给别人）"
 
   if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
     if firewall-cmd --query-port="$PORT/tcp" >/dev/null 2>&1; then
@@ -412,7 +440,8 @@ start_vllm() {
   local px=(); mapfile -t px < <(proxy_run_args)
   local home; home="$(container_home "$VLLM_IMAGE")"; home="${home:-/root}"
   # shellcheck disable=SC2086
-  docker run -d --name "$C_VLLM" "${net[@]}" \
+  local lim=(); mapfile -t lim < <(limit_args)
+  docker run -d --name "$C_VLLM" "${net[@]}" "${lim[@]}" \
     --gpus "device=$GPU_ID" \
     --restart unless-stopped \
     --shm-size 8g \
@@ -451,7 +480,8 @@ start_api() {
     extra+=(--gpus "device=$GPU_ID" -e CUDA_VISIBLE_DEVICES="")
     vols=(-v "$V_MODELS":"$home/.paddlex" -v "$V_CACHE":"$home/.cache")
   fi
-  docker run -d --name "$C_API" --network "$NET" \
+  local lim=(); mapfile -t lim < <(limit_args)
+  docker run -d --name "$C_API" --network "$NET" "${lim[@]}" \
     --restart unless-stopped \
     -p "$BIND:$PORT:8000" \
     "${extra[@]}" \
