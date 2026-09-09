@@ -331,12 +331,22 @@ class PipelinePool:
         for i in range(self.size):
             t0 = time.perf_counter()
             try:
-                self._q.put(self.engine.build())
+                inst = self.engine.build()
+                # 建完 session 还不算能用：GPU 上第一次推理要 JIT 编译 + cuDNN
+                # 算法搜索，能花几十秒。不在这里付掉，就会砸到第一批真实请求头上。
+                # 预热失败不影响可用性，照常入池，只是第一次请求会慢些。
+                note = ""
+                try:
+                    note = self.engine.warm(inst) or ""
+                except Exception as exc:
+                    note = "预热失败(%s)，首次请求会慢" % type(exc).__name__
+                self._q.put(inst)
                 with self._lock:
                     self.ready += 1
-                print("[pool:%s] %d/%d 就绪（%.1fs）"
+                print("[pool:%s] %d/%d 就绪（%.1fs）%s"
                       % (self.engine.name, i + 1, self.size,
-                         time.perf_counter() - t0), flush=True)
+                         time.perf_counter() - t0,
+                         ("  预热 " + note) if note else ""), flush=True)
             except Exception:
                 self.error = traceback.format_exc(limit=6)
                 print("[pool:%s] 第 %d 条构建失败:" % (self.engine.name, i + 1), flush=True)
@@ -353,7 +363,17 @@ class PipelinePool:
         def run():
             try:
                 print("[pool:%s] 重建（%s）…" % (self.engine.name, note), flush=True)
-                fresh = [self.engine.build() for _ in range(self.size)]
+                fresh = []
+                for _ in range(self.size):
+                    inst = self.engine.build()
+                    # 和首次预热同理：新实例没热就换上去，等于把冷启动的账
+                    # 转嫁给下一批请求。换之前先跑热。
+                    try:
+                        self.engine.warm(inst)
+                    except Exception as exc:
+                        print("[pool:%s] 重建预热失败(%s)，忽略"
+                              % (self.engine.name, type(exc).__name__), flush=True)
+                    fresh.append(inst)
                 nq: "queue.Queue" = queue.Queue()
                 for x in fresh:
                     nq.put(x)

@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import os
+import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -35,6 +37,16 @@ class OcrEngine:
     def run(self, handle, path: str, merge_tables: bool, overrides: dict | None = None):
         """统一返回 (markdown, pages_json, npages)。"""
         raise NotImplementedError
+
+    def warm(self, handle) -> str:
+        """在池子就绪前真的跑一次推理，把一次性开销从首批真实请求里挪走。
+
+        构造 session 和「能跑」是两回事：GPU 上建 session 很快，真正贵的是
+        第一次推理时的 PTX JIT 编译和 cuDNN 卷积算法搜索。不预热的话这笔账
+        全砸在第一批请求头上 —— 实测能让 P95 冲到 73 秒，而热起来之后只要 281ms。
+        默认空实现；子类按自己的输入形状覆盖。
+        """
+        return ""
 
     def describe(self) -> dict:
         return {"engine": self.name, "label": self.label, "supports_pdf": self.supports_pdf}
@@ -125,6 +137,49 @@ class FastEngine(OcrEngine):
                       for it in items],
         }
         return md, [page], 1
+
+    def warm(self, handle) -> str:
+        """跑两种尺寸的合成图，把 JIT 和 cuDNN 算法搜索的账在就绪前付掉。
+
+        必须让检测真的框出文字 —— 否则识别分支根本不执行，rec 那两个 session
+        还是冷的，第一批真实请求照样要等。所以用大号字体画几行，
+        画不出中文就退回 PIL 默认位图字体（英文数字够触发检测了）。
+        """
+        from PIL import Image, ImageDraw, ImageFont
+        font = None
+        for fp in ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+                   "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc"):
+            try:
+                font = ImageFont.truetype(fp, 30)
+                break
+            except Exception:
+                continue
+
+        notes = []
+        # 检测分支按整图尺寸取整到 32 的倍数，识别分支按每行文字宽度变长；
+        # cuDNN 的算法选择是按 shape 缓存的，形状没见过就要重搜一轮。
+        # 两种尺寸 + 长短不一的行，覆盖住最常见的那几个 shape。
+        for w, h in ((640, 360), (960, 540)):
+            img = Image.new("RGB", (w, h), "white")
+            d = ImageDraw.Draw(img)
+            for i, s in enumerate(("warmup 12345", "预热 ABCDEFG 67890",
+                                   "knock-ocr 一二三四五六七八九十")):
+                d.text((24, 40 + i * 70), s, fill="black", font=font)
+            path = ""
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    path = f.name
+                img.save(path)
+                t0 = time.perf_counter()
+                handle(path)
+                notes.append("%dx%d %.0fms" % (w, h, (time.perf_counter() - t0) * 1000))
+            finally:
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+        return "  ".join(notes)
 
     def describe(self) -> dict:
         # device 报「实际」而不是「请求」—— 老版本这里直接回显环境变量，

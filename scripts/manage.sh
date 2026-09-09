@@ -126,6 +126,10 @@ C_VLLM="${PROJECT}-vllm"
 C_API="${PROJECT}-api"
 V_MODELS="${PROJECT}-models"
 V_CACHE="${PROJECT}-cache"               # 整个 ~/.cache：huggingface / modelscope / vLLM 编译缓存
+# CUDA 把 PTX 的 JIT 编译结果缓存在 ~/.nv/ComputeCache。官方 wheel 若没为 sm_120
+# 预编译 kernel，首次推理就要现场 JIT，实测能占掉几十秒。容器一删缓存就没，
+# 每次 redeploy 都要重付一遍 —— 挂成卷留住。
+V_NVCACHE="${PROJECT}-nvcache"
                                          # 挂子目录会让 docker 以 root 造出父目录 ~/.cache，
                                          # 导致 vLLM 写不了 ~/.cache/vllm 的 torch.compile 缓存
 STATE="$ROOT/.deploy"
@@ -486,6 +490,9 @@ resolve_device() {
 # ---------------------------------------------------------------- 构建 / 启动
 ensure_net() {
   docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
+  if needs_gpu && ! uses_vllm; then
+    docker volume inspect "$V_NVCACHE" >/dev/null 2>&1 || docker volume create "$V_NVCACHE" >/dev/null
+  fi
   docker volume inspect "$V_MODELS" >/dev/null 2>&1 || docker volume create "$V_MODELS" >/dev/null
   docker volume inspect "$V_CACHE"  >/dev/null 2>&1 || docker volume create "$V_CACHE" >/dev/null
 
@@ -586,6 +593,7 @@ start_api() {
     vols=(-v "$V_MODELS":"$home/.paddlex" -v "$V_CACHE":"$home/.cache")
   elif needs_gpu; then
     extra+=(--gpus "device=$GPU_ID")
+    vols=(-v "$V_NVCACHE":"$home/.nv")     # 留住 PTX JIT 缓存，redeploy 不用重编
   fi
   local lim=(); mapfile -t lim < <(limit_args)
   docker run -d --name "$C_API" --network "$NET" "${lim[@]}" \
@@ -943,7 +951,7 @@ cmd_disk() {
   say "镜像（拉过就不再拉，除非手动删）"
   docker images --format '  {{.Size}}\t{{.Repository}}:{{.Tag}}' | grep -E "paddleocr|$PROJECT" || dim "  （还没拉）"
   say "模型缓存卷（down/reset 都不会删）"
-  for v in "$V_MODELS" "$V_CACHE"; do
+  for v in "$V_MODELS" "$V_CACHE" "$V_NVCACHE"; do
     if docker volume inspect "$v" >/dev/null 2>&1; then
       local mp sz; mp="$(docker volume inspect -f '{{.Mountpoint}}' "$v")"
       sz="$(du -sh "$mp" 2>/dev/null | cut -f1)"
@@ -956,7 +964,7 @@ cmd_disk() {
   df -h /var/lib/docker 2>/dev/null | sed 's/^/  /'
   echo
   dim "  彻底删干净（下次要重下）："
-  dim "    docker volume rm $V_MODELS $V_CACHE"
+  dim "    docker volume rm $V_MODELS $V_CACHE $V_NVCACHE"
   dim "    docker image rm $VLLM_IMAGE $BASE_IMAGE"
   dim "  ⚠ 不要用 docker system prune -a，会把上面全清掉"
 }
@@ -1135,7 +1143,7 @@ cmd_clean() {
   docker image rm "$API_IMAGE" >/dev/null 2>&1 || true
   rm -rf "$STATE"
   ok "已清理"
-  dim "  模型缓存卷保留（重装免下载）：docker volume rm $V_MODELS $V_CACHE"
+  dim "  模型缓存卷保留（重装免下载）：docker volume rm $V_MODELS $V_CACHE $V_NVCACHE"
   dim "  官方基础镜像保留：docker image rm $VLLM_IMAGE $BASE_IMAGE"
 }
 
