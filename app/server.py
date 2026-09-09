@@ -142,9 +142,16 @@ def parse_uploads(content_type: str, body: bytes) -> list:
         JSON + url           {"url": "..."} 或 {"urls": ["...", "..."]}
         JSON + base64        {"image_base64": "..."} 或 {"images_base64": [...]}
     """
-    ctype = (content_type or "").strip().lower()
+    # 注意：ctype 必须保留原始大小写。multipart 的 boundary 是大小写敏感的，
+    # 浏览器发的是 `boundary=----WebKitFormBoundaryAbC123` 这种含大写的值，
+    # 整条 header 转小写后解析器就找不到起始边界了（StartBoundaryNotFoundDefect），
+    # payload 不会变成 list，is_multipart() 返回 False —— 表现就是界面上传一律
+    # 报「multipart 格式不正确」，而 curl 完全正常，因为它的 boundary 是纯小写
+    # 十六进制。判类型用小写副本，解析用原值。
+    ctype = (content_type or "").strip()
+    kind = ctype.lower()
 
-    if ctype.startswith("application/json"):
+    if kind.startswith("application/json"):
         import base64 as _b64
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -172,16 +179,20 @@ def parse_uploads(content_type: str, body: bytes) -> list:
                 raise HTTPException(400, "第 %d 个 base64 解码失败：%s" % (i + 1, e))
         return out
 
-    if not ctype.startswith("multipart/"):
+    if not kind.startswith("multipart/"):
         return [("", body)]
 
     header = b"Content-Type: " + ctype.encode("latin-1", "replace") + CRLF + CRLF
     try:
         msg = BytesParser().parsebytes(header + body)
-    except Exception:
-        raise HTTPException(400, "multipart 解析失败")
+    except Exception as e:
+        raise HTTPException(400, "multipart 解析失败：%s" % e)
     if not msg.is_multipart():
-        raise HTTPException(400, "multipart 格式不正确")
+        # 把 defect 名字带出去。光说「格式不正确」等于什么都没说，
+        # 上一次查这个问题就是卡在这条消息上。
+        why = "、".join(d.__class__.__name__ for d in msg.defects) or "未找到分段"
+        raise HTTPException(400, "multipart 格式不正确（%s）；boundary=%r"
+                                 % (why, msg.get_boundary()))
 
     files, fallback = [], []
     for part in msg.walk():

@@ -908,6 +908,36 @@ cmd_logs() {
   esac
 }
 
+# 模拟浏览器的 multipart 请求。
+#
+# curl 生成的 boundary 是纯小写十六进制，而浏览器发的是含大写的
+# `----WebKitFormBoundaryXxYy`。服务端一度把整条 Content-Type 转成小写再解析，
+# boundary 大小写被抹掉 -> 找不到起始分段 -> 界面上传一律报「multipart 格式不正确」，
+# 而 curl 全绿。所以这条检查必须自己拼 body，不能用 -F。
+check_browser_multipart() {
+  local img="$1" bnd='----WebKitFormBoundaryKnockOcrAbC123'
+  local tmp="$STATE/browser_multipart.bin"
+  {
+    printf -- '--%s\r\n' "$bnd"
+    printf -- 'Content-Disposition: form-data; name="file"; filename="%s"\r\n' "$(basename "$img")"
+    printf -- 'Content-Type: application/octet-stream\r\n\r\n'
+    cat "$img"
+    printf -- '\r\n--%s--\r\n' "$bnd"
+  } > "$tmp"
+  local out rc=0
+  out="$(curl -sS -m 300 -o /dev/null -w '%{http_code}' \
+        -H "Content-Type: multipart/form-data; boundary=$bnd" \
+        --data-binary "@$(hostpath "$tmp")" \
+        "http://127.0.0.1:$PORT/api/ocr?include_json=false" 2>&1)" || rc=$?
+  rm -f "$tmp"
+  if [ "$rc" -eq 0 ] && [ "$out" = "200" ]; then
+    ok "浏览器式 multipart（boundary 含大写）通过"
+  else
+    warn "浏览器式 multipart 失败（HTTP $out）—— 界面上传会报错，但 curl 察觉不到"
+    dim "      boundary 大小写敏感，服务端解析前不能把 Content-Type 转小写。"
+  fi
+}
+
 cmd_test() {
   local f="${1:-}"
   if [ -n "$f" ]; then
@@ -924,6 +954,7 @@ cmd_test() {
     || die "请求失败，先看 bash scripts/manage.sh logs api"
   t1="$(date +%s%3N)"
   ok "完成，耗时 $((t1 - t0)) ms"
+  check_browser_multipart "$f"
   python3 - "$STATE/result.json" <<'PY' 2>/dev/null || cat "$STATE/result.json"
 import json,sys
 d=json.load(open(sys.argv[1],encoding="utf-8"))
