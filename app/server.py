@@ -321,24 +321,46 @@ app = FastAPI(title="knock-ocr", version="0.3.0",
               docs_url="/api/docs", lifespan=lifespan)
 
 
+# VLM 探活结果缓存。/api/info 被界面每几秒轮询一次，如果每次都同步 urlopen，
+# vLLM 未就绪时会一直卡在超时上，把线程池占满 —— 表现就是界面「无法连接服务」。
+_VL_PROBE = {"at": 0.0, "val": None}
+_VL_PROBE_TTL = float(os.environ.get("OCR_VL_PROBE_TTL", "5"))
+_VL_PROBE_TIMEOUT = float(os.environ.get("OCR_VL_PROBE_TIMEOUT", "2"))
+_VL_PROBE_LOCK = threading.Lock()
+
+
 def _vl_backend_status() -> dict:
     eng = ENGINES.get("quality")
     if eng is None:
         return {"required": False, "reachable": True,
                 "note": "当前档位（%s）不含 VL 引擎" % TIER}
-    probe = eng.server_url.rstrip("/") + "/models"
-    out = {"required": True, "url": eng.server_url, "probe": probe,
-           "reachable": False, "models": []}
-    try:
-        import urllib.request
 
-        with urllib.request.urlopen(probe, timeout=10) as r:
-            data = json.loads(r.read().decode())
-            out["reachable"] = True
-            out["models"] = [m.get("id") for m in data.get("data", [])]
-    except Exception as e:
-        out["error"] = str(e)
-    return out
+    now = time.time()
+    cached = _VL_PROBE["val"]
+    if cached is not None and now - _VL_PROBE["at"] < _VL_PROBE_TTL:
+        return cached
+    # 同一时刻只让一个请求真去探测，其余直接用上一次结果，避免探测风暴
+    if not _VL_PROBE_LOCK.acquire(blocking=False):
+        return cached or {"required": True, "reachable": False, "note": "探测中"}
+
+    try:
+        probe = eng.server_url.rstrip("/") + "/models"
+        out = {"required": True, "url": eng.server_url, "probe": probe,
+               "reachable": False, "models": []}
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(probe, timeout=_VL_PROBE_TIMEOUT) as r:
+                data = json.loads(r.read().decode())
+                out["reachable"] = True
+                out["models"] = [m.get("id") for m in data.get("data", [])]
+        except Exception as e:
+            out["error"] = str(e)
+        _VL_PROBE["val"] = out
+        _VL_PROBE["at"] = time.time()
+        return out
+    finally:
+        _VL_PROBE_LOCK.release()
 
 
 @app.get("/healthz")

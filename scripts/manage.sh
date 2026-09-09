@@ -23,6 +23,11 @@ WORKERS_FAST="${WORKERS_FAST:-8}"        # 快通道每进程的流水线数
 # 单次 ONNX/Paddle 推理会吃满 CPU，靠并发请求提不了吞吐 ——
 # 必须「每次推理只用少量线程 + 多进程」才能把多核吃满。128 核机器尤其明显。
 OMP_THREADS="${OMP_THREADS:-4}"          # 单次推理的线程数上限
+# ONNX Runtime 的 intra_op 默认 0 = 用「它看到的所有核」。容器里它看到的是宿主机
+# 核数（比如 128），而 cgroup 配额可能只有 32 —— 线程数超配额几倍，全耗在抢锁上，
+# 实测能慢几十倍。必须显式对齐到 CPU 配额。
+ORT_INTRA="${ORT_INTRA:-$OMP_THREADS}"   # fast 引擎单次推理的 ONNX 线程数
+FAST_CUDA="${FAST_CUDA:-0}"              # =1 让 fast 引擎走 CUDA EP（需 onnxruntime-gpu）
 
 # ---- 资源占用上限：这台机器还跑着别的服务，默认只吃一小部分 ----
 # 都可以覆盖。想吃满就传 CPU_LIMIT=0 MEM_LIMIT=0（不推荐）。
@@ -506,6 +511,8 @@ start_api() {
     -e "OCR_CACHE_SIZE=$CACHE_SIZE" \
     -e "UVICORN_WORKERS=$UVICORN_WORKERS" \
     -e "OMP_NUM_THREADS=$OMP_THREADS" \
+    -e "OCR_ORT_INTRA_THREADS=$ORT_INTRA" \
+    -e "OCR_FAST_CUDA=$FAST_CUDA" \
     -e "OPENBLAS_NUM_THREADS=$OMP_THREADS" \
     -e "MKL_NUM_THREADS=$OMP_THREADS" \
     -e "OCR_WORKERS_QUALITY=$WORKERS" \
@@ -1025,6 +1032,11 @@ knock-ocr demo
   CPU_LIMIT=<核数/4>    CPU 时间片配额。空闲不占，超限只限速，不会挤到别人。0=不限
   MEM_LIMIT=16g|48g     内存硬上限。超限直接 OOM Kill，按峰值+余量给，别抠
   CPUSET=               物理绑核，如 0-31。比配额更硬，NUMA 机器还有访存局部性收益
+  ORT_INTRA=<=OMP_THREADS>  fast 引擎单次推理的 ONNX 线程数。
+                        默认 0 会用「容器看到的全部核」，在有 CPU 配额时会
+                        严重超配（128 线程抢 32 核），必须对齐到配额
+  FAST_CUDA=0           =1 让 fast 引擎走 CUDA EP（需 onnxruntime-gpu；
+                        官方包可能不含 sm_120，会静默回落 CPU，开完要对比耗时）
   GPU_MEM_UTIL=0.35     vLLM 占该卡显存的比例，其余留给别人
   UVICORN_WORKERS=      API 进程数，默认按 CPU 配额推算
   CACHE_SIZE=512        sha256 内容寻址缓存条数；0=关闭

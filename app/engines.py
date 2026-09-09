@@ -46,14 +46,55 @@ class FastEngine(OcrEngine):
     label = "RapidOCR / PP-OCRv6 (ONNX)"
     supports_pdf = False
 
+    def __init__(self):
+        # intra_op_num_threads 默认 0 = ONNX 自己决定 = 用「它看到的所有核」。
+        # 容器里它看到的是宿主机核数（128），而 cgroup 配额可能只有 32 ——
+        # 128 个线程抢 32 核的配额，全耗在上下文切换上，实测能慢几十倍。
+        # 所以必须显式限制成和 CPU 配额匹配。
+        self.intra = int(os.environ.get("OCR_ORT_INTRA_THREADS")
+                         or os.environ.get("OMP_NUM_THREADS") or 4)
+        self.inter = int(os.environ.get("OCR_ORT_INTER_THREADS") or 1)
+        # ONNX Runtime 的 CUDA EP。注意官方 onnxruntime-gpu 包可能不含 sm_120 kernel，
+        # 那种情况下会「静默回落 CPU」而不报错 —— 开了之后务必对比耗时确认真的更快。
+        self.use_cuda = os.environ.get("OCR_FAST_CUDA", "").strip().lower() in ("1", "true", "yes")
+        self.applied: dict = {}
+
     def build(self):
         # 新版 rapidocr 默认就是 PP-OCRv6 的 det/rec small；
         # 老包 rapidocr_onnxruntime 作为兜底（模型是 v4/v5 系列）。
         try:
             from rapidocr import RapidOCR
+            new_pkg = True
         except ImportError:
             from rapidocr_onnxruntime import RapidOCR
-        return RapidOCR()
+            new_pkg = False
+
+        if not new_pkg:
+            self.applied = {"note": "经典包不支持线程配置，用 OMP_NUM_THREADS 兜底"}
+            return RapidOCR()
+
+        params = {
+            "EngineConfig.onnxruntime.intra_op_num_threads": self.intra,
+            "EngineConfig.onnxruntime.inter_op_num_threads": self.inter,
+        }
+        if self.use_cuda:
+            params["EngineConfig.onnxruntime.use_cuda"] = True
+
+        # 参数名按 rapidocr 版本可能有出入：被拒就逐个丢掉重试，不让服务起不来
+        while True:
+            try:
+                eng = RapidOCR(params=params)
+                self.applied = dict(params)
+                return eng
+            except TypeError:
+                self.applied = {"note": "本版本 RapidOCR 不接受 params，退回默认配置"}
+                return RapidOCR()
+            except Exception as e:
+                bad = next((k for k in params if k.split(".")[-1] in str(e)), None)
+                if not bad:
+                    raise
+                params.pop(bad)
+                print("[engine] RapidOCR 不支持 " + bad + "，已忽略", flush=True)
 
     def run(self, handle, path: str, merge_tables: bool, overrides: dict | None = None):
         if Path(path).suffix.lower() == ".pdf":
@@ -79,7 +120,11 @@ class FastEngine(OcrEngine):
         return md, [page], 1
 
     def describe(self) -> dict:
-        return {**super().describe(), "runtime": "onnxruntime", "device": "cpu"}
+        return {**super().describe(), "runtime": "onnxruntime",
+                "device": "cuda" if self.use_cuda else "cpu",
+                "intra_op_num_threads": self.intra,
+                "inter_op_num_threads": self.inter,
+                "applied": self.applied}
 
 
 def _seq(v):
