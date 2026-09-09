@@ -15,6 +15,7 @@ fast 档不装 PaddleOCR-VL，镜像 <1GB，也不需要 GPU。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -24,6 +25,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager, contextmanager
 from email.parser import BytesParser
 from pathlib import Path
@@ -41,6 +43,12 @@ TIER = os.environ.get("OCR_TIER", "quality").strip().lower()
 MAX_MB = int(os.environ.get("OCR_MAX_MB", "50"))
 # 单请求排队等流水线的上限；超时直接 503，避免请求堆积拖垮服务
 ACQUIRE_TIMEOUT = float(os.environ.get("OCR_ACQUIRE_TIMEOUT", "120"))
+# 内容寻址缓存：key = sha256(图片字节) + 引擎 + 影响结果的参数。
+# 爬虫场景重复图极多（经验 30~60%），这是最省事的一项吞吐优化 ——
+# 不需要队列、不需要额外组件。0 表示关闭。
+# 注意：进程内缓存，UVICORN_WORKERS>1 时每个进程各存一份；
+# 要跨进程/跨机共享，换成 Redis 即可，key 的算法不用变。
+CACHE_SIZE = int(os.environ.get("OCR_CACHE_SIZE", "512"))
 
 
 def _num_env(name, cast=int):
@@ -121,6 +129,57 @@ def parse_upload(content_type: str, body: bytes) -> tuple[str, bytes]:
     if fallback:
         return fallback
     raise HTTPException(400, "multipart 中没有找到文件")
+
+
+# --------------------------------------------------------------- 结果缓存
+class ResultCache:
+    """按内容寻址的 LRU。只缓存成功结果，失败不进缓存。"""
+
+    def __init__(self, size: int):
+        self.size = size
+        self._d: "OrderedDict[str, dict]" = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def key(blob: bytes, engine: str, params: dict) -> str:
+        h = hashlib.sha256(blob)
+        # 参数会改变结果，必须进 key，否则调完参数拿到的还是旧结果
+        h.update(json.dumps({"e": engine, "p": params}, sort_keys=True).encode())
+        return h.hexdigest()
+
+    def get(self, k: str):
+        if self.size <= 0:
+            return None
+        with self._lock:
+            v = self._d.get(k)
+            if v is None:
+                self.misses += 1
+                return None
+            self._d.move_to_end(k)
+            self.hits += 1
+            return v
+
+    def put(self, k: str, v: dict):
+        if self.size <= 0:
+            return
+        with self._lock:
+            self._d[k] = v
+            self._d.move_to_end(k)
+            while len(self._d) > self.size:
+                self._d.popitem(last=False)
+
+    def snapshot(self) -> dict:
+        total = self.hits + self.misses
+        with self._lock:
+            n = len(self._d)
+        return {"enabled": self.size > 0, "size": n, "capacity": self.size,
+                "hits": self.hits, "misses": self.misses,
+                "hit_rate": round(self.hits / total, 3) if total else None}
+
+
+CACHE = ResultCache(CACHE_SIZE)
 
 
 # --------------------------------------------------------------- 流水线池
@@ -308,12 +367,14 @@ def info():
         "rebuilding": bool(q and q.rebuilding),
         "metrics": METRICS.snapshot(),
         "totals": METRICS.totals(),
+        "cache": CACHE.snapshot(),
     }
 
 
 @app.get("/api/metrics")
 def metrics():
     return {"tier": TIER, "by_engine": METRICS.snapshot(),
+            "cache": CACHE.snapshot(),
             "pools": {k: p.snapshot() for k, p in POOLS.items()}}
 
 
@@ -376,6 +437,18 @@ async def ocr(
          else TUNING.get("max_new_tokens")),
     ) if k in eng.per_request_keys}
 
+    ckey = ResultCache.key(blob, eng.name, {**overrides, "mt": merge_tables})
+    hit = CACHE.get(ckey)
+    if hit is not None:
+        METRICS.record(eng.name, (time.perf_counter() - t_start) * 1000, True)
+        body = dict(hit)
+        body["request_id"] = rid
+        body["cached"] = True
+        body["elapsed_ms"] = round((time.perf_counter() - t_start) * 1000, 1)
+        if not include_json:
+            body.pop("result", None)
+        return JSONResponse(body)
+
     timings = {"receive_ms": round((t_body - t_start) * 1000, 1)}
     ok = False
     tmp = None
@@ -408,8 +481,11 @@ async def ocr(
             "applied": {k: v for k, v in overrides.items() if v is not None},
             "markdown": md,
         }
-        if include_json:
-            body["result"] = pages_json
+        body["cached"] = False
+        body["result"] = pages_json           # 先完整入缓存，再按需裁剪返回
+        CACHE.put(ckey, body)
+        if not include_json:
+            body = {k: v for k, v in body.items() if k != "result"}
         return JSONResponse(body)
 
     except HTTPException:

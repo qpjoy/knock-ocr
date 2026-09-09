@@ -24,6 +24,8 @@ WORKERS_FAST="${WORKERS_FAST:-8}"        # 快通道每进程的流水线数
 # 必须「每次推理只用少量线程 + 多进程」才能把多核吃满。128 核机器尤其明显。
 UVICORN_WORKERS="${UVICORN_WORKERS:-1}"  # API 进程数；fast 档吃 CPU，按核数调大
 OMP_THREADS="${OMP_THREADS:-4}"          # 单次推理的线程数上限
+CACHE_SIZE="${CACHE_SIZE:-512}"          # 内容寻址缓存条数（sha256 去重）；0=关闭
+                                         # 爬虫重复图多，命中率 30~60%，直接抬高有效吞吐
 PROJECT="${PROJECT:-knock-ocr}"          # 容器/网络/卷名前缀，改它可并存多套
 GPU_ID="${GPU_ID:-2}"                    # 只占用这一张卡（默认避开挂显示器的 GPU3）
 PORT="${PORT:-8710}"                     # 对外 Web + API 端口；被占用会自动顺延
@@ -460,6 +462,7 @@ start_api() {
     -e "OCR_MODEL=$MODEL" \
     -e "OCR_VLLM_URL=$vurl" \
     -e "OCR_WORKERS_FAST=$WORKERS_FAST" \
+    -e "OCR_CACHE_SIZE=$CACHE_SIZE" \
     -e "UVICORN_WORKERS=$UVICORN_WORKERS" \
     -e "OMP_NUM_THREADS=$OMP_THREADS" \
     -e "OPENBLAS_NUM_THREADS=$OMP_THREADS" \
