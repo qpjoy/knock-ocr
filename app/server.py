@@ -671,7 +671,8 @@ def _pick_pool(engine: str | None) -> PipelinePool:
 
 
 def _run_one(pool: PipelinePool, filename: str, blob: bytes,
-             merge_tables: bool, overrides: dict, include_json: bool) -> dict:
+             merge_tables: bool, overrides: dict, include_json: bool,
+             no_cache: bool = False) -> dict:
     """跑一个文件，返回响应体。同步接口和队列 worker 共用这一段。"""
     eng = pool.engine
     rid = uuid.uuid4().hex[:12]
@@ -684,7 +685,7 @@ def _run_one(pool: PipelinePool, filename: str, blob: bytes,
                                  % (eng.name, filename, sorted(allowed)))
 
     ckey = ResultCache.key(blob, eng.name, {**overrides, "mt": merge_tables})
-    hit = CACHE.get(ckey)
+    hit = None if no_cache else CACHE.get(ckey)
     if hit is not None:
         METRICS.record(eng.name, (time.perf_counter() - t0) * 1000, True)
         body = dict(hit)
@@ -712,7 +713,8 @@ def _run_one(pool: PipelinePool, filename: str, blob: bytes,
                 "elapsed_ms": timings["total_ms"], "timings": timings,
                 "applied": {k: v for k, v in overrides.items() if v is not None},
                 "markdown": md, "cached": False, "result": pages_json}
-        CACHE.put(ckey, body)
+        if not no_cache:
+            CACHE.put(ckey, body)
         return body if include_json else {k: v for k, v in body.items() if k != "result"}
     except HTTPException:
         raise
@@ -736,6 +738,7 @@ async def ocr(
     engine: str | None = Query(None, description="fast=快 | quality=准；不传用默认"),
     merge_tables: bool = Query(True, description="多页 PDF 是否合并跨页表格"),
     include_json: bool = Query(True, description="是否返回结构化结果"),
+    no_cache: bool = Query(False, description="跳过缓存，用来测真实推理耗时"),
     layout_threshold: float | None = Query(None, ge=0.05, le=0.95),
     max_pixels: int | None = Query(None, ge=100000, le=20000000),
     max_new_tokens: int | None = Query(None, ge=64, le=8192),
@@ -768,7 +771,8 @@ async def ocr(
         out = []
         for name, blob in items:
             try:
-                out.append(_run_one(pool, name, blob, merge_tables, overrides, include_json))
+                out.append(_run_one(pool, name, blob, merge_tables, overrides,
+                                    include_json, no_cache))
             except HTTPException as e:
                 # 批量里单个失败不该让整批 400 —— 标注出来，其余照常返回
                 out.append({"filename": name, "error": e.detail, "status": e.status_code})

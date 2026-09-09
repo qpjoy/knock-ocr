@@ -1069,7 +1069,9 @@ knock-ocr demo
   logs [api|vllm]
   test [文件]   端到端识别一次（不传文件则自动造一张）
   compare [文件] 同一张图两个引擎各跑一遍，并排对比质量与耗时
-  bench         并发压测，看 QPS / P50 / P95
+  bench         并发压测。默认每请求一张新图（不会被缓存蒙蔽）
+                  --mode cached  同一张图，测缓存路径能扛多少
+                  --mode nocache 服务端跳过缓存，测纯推理
   doctor        一次抓全所有诊断信息（卡住/报错时先跑这个）
   selftest      绕开本项目 API，用官方 CLI 在 vLLM 容器内直接识别一次
   netcheck      在容器里测能不能连上模型源（连不上模型时先跑这个）
