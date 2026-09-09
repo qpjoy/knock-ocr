@@ -92,6 +92,11 @@ details.tune[open]>summary{border-bottom:1px solid var(--line);color:var(--fg);f
 .applybar button{font-size:12.5px;padding:6px 16px;border-radius:8px;border:1px solid var(--accent);
   background:var(--accent);color:#fff;cursor:pointer}
 .applybar button:disabled{opacity:.4;cursor:default}
+.usage-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.usage-tabs button{font-size:12px;padding:5px 12px;border:1px solid var(--line);
+  border-radius:20px;background:var(--bg);color:var(--fg);cursor:pointer}
+.usage-tabs button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+#usageCode{max-height:none}
 button.copy{float:right;font-size:11.5px;padding:3px 10px;border:1px solid var(--line);
   background:var(--panel);color:var(--dim);border-radius:6px;cursor:pointer}
 </style>
@@ -180,10 +185,25 @@ button.copy{float:right;font-size:11.5px;padding:3px 10px;border:1px solid var(-
   <div class="meta" id="meta"></div>
 </div>
 
-<div class="hint">
-  同一个能力的 API 调用方式：
-  <pre>curl -F 'file=@page.png' http://<span id="host">…</span>/api/ocr</pre>
-</div>
+<details class="tune" id="usage" open>
+  <summary>接口用法 <span style="font-weight:400">· 爬虫接入看这里</span></summary>
+  <div class="tunebody">
+    <p style="margin:0 0 12px;font-size:12.5px;color:var(--dim)">
+      服务地址 <code id="host">…</code>。四种传参方式同一个端点，按场景选：
+    </p>
+
+    <div class="usage-tabs" id="usageTabs">
+      <button class="on" data-u="url">URL（爬虫首选）</button>
+      <button data-u="file">上传文件</button>
+      <button data-u="b64">base64</button>
+      <button data-u="async">异步队列</button>
+    </div>
+
+    <pre id="usageCode"></pre>
+
+    <p style="margin:12px 0 0;font-size:12px;color:var(--dim)" id="usageNote"></p>
+  </div>
+</details>
 
 </div>
 <script>
@@ -242,6 +262,75 @@ function renderMd(src){
 }
 
 
+
+/* ---------- 接口用法 ---------- */
+function usageSnippets(){
+  const H = location.host, E = ENGINE || 'fast';
+  return {
+    url: {
+      // 一律写成单行：模板字符串里行尾的反斜杠是「续行符」，会把反斜杠和换行
+      // 一起吃掉，示例就断了。单行既没这个坑，复制粘贴也直接能跑。
+      code:
+`# 爬虫已经有 URL 了，直接给 URL —— 省掉「先下载再上传」这一趟往返
+curl -X POST 'http://${H}/api/ocr?engine=${E}' -H 'Content-Type: application/json' -d '{"url":"https://example.com/a.jpg"}'
+
+# 一次多个（最多 32 个），返回 {"count":n,"items":[...]}
+curl -X POST 'http://${H}/api/ocr?engine=${E}' -H 'Content-Type: application/json' -d '{"urls":["https://a.com/1.jpg","https://a.com/2.jpg"]}'`,
+      note: '服务端去抓图。想限制可抓域名：部署时传 OCR_FETCH_ALLOW_HOSTS=a.com,b.com'
+    },
+    file: {
+      code:
+`# 本地文件，最省带宽
+curl -F 'file=@page.png' 'http://${H}/api/ocr?engine=${E}'
+
+# 一次多个
+curl -F 'file=@a.png' -F 'file=@b.png' 'http://${H}/api/ocr?engine=${E}'
+
+# 不要结构化 JSON（省带宽，只要 markdown）
+curl -F 'file=@a.png' 'http://${H}/api/ocr?engine=${E}&include_json=false'`,
+      note: '也支持裸 body：curl --data-binary @a.png -H "X-Filename: a.png"'
+    },
+    b64: {
+      code:
+`# 图片已经在内存里、调用方只发 JSON 时用这个
+curl -X POST 'http://${H}/api/ocr?engine=${E}' -H 'Content-Type: application/json' -d '{"image_base64":"iVBORw0KGgo..."}'
+
+# data URI 也认
+#   {"image_base64":"data:image/png;base64,iVBORw0..."}
+# 多个用 images_base64: [...]`,
+      note: 'base64 会让体积涨约 33%，能用 URL 或文件就别用它'
+    },
+    async: {
+      code:
+`# 投递后立刻返回 job id，连接不占着 —— 爬虫大批量用这个
+curl -X POST 'http://${H}/api/ocr/async?engine=${E}' -H 'Content-Type: application/json' -d '{"urls":["https://a.com/1.jpg","https://a.com/2.jpg"]}'
+# -> 202 {"jobs":[{"id":"ab12...","state":"queued"}],"queued":3}
+
+# 取结果
+curl 'http://${H}/api/jobs/ab12...'
+# -> {"state":"done","result":{...}}  |  queued / running / failed
+
+# 队列概况
+curl 'http://${H}/api/jobs'`,
+      note: '队列满会返回 429 —— 那是明确的背压信号，退避重试即可，别硬冲'
+    }
+  };
+}
+
+function paintUsage(){
+  const key = document.querySelector('#usageTabs button.on').dataset.u;
+  const snip = usageSnippets()[key];
+  $('#usageCode').textContent = snip.code;
+  $('#usageNote').textContent = snip.note;
+}
+document.querySelectorAll('#usageTabs button').forEach(function(b){
+  b.onclick = function(){
+    document.querySelectorAll('#usageTabs button').forEach(function(x){ x.classList.remove('on'); });
+    b.classList.add('on');
+    paintUsage();
+  };
+});
+
 /* ---------- 引擎选择 ---------- */
 let ENGINE = null;              // 当前选择
 let AVAILABLE = [];             // 本次部署实际具备的引擎（由 /api/info 给出）
@@ -262,6 +351,7 @@ function paintEngines(){
   // 参数面板只对 quality 有意义
   $('#tune').style.display = (ENGINE === 'quality') ? '' : 'none';
   try{ localStorage.setItem('knock-ocr-engine', ENGINE); }catch(_){}
+  paintUsage();
 }
 
 document.querySelectorAll('#engsel button').forEach(function(b){
@@ -277,6 +367,7 @@ const PRESETS = {
 const K = {layout:$('#kLayout'), pixels:$('#kPixels'), tokens:$('#kTokens'), conc:$('#kConc')};
 const O = {layout:$('#oLayout'), pixels:$('#oPixels'), tokens:$('#oTokens'), conc:$('#oConc')};
 let serverConc = null;   // 服务端当前生效的并发，用来判断要不要点「应用」
+let lastOk = 0;          // 上次成功拿到状态的时间戳
 
 function mp(v){ return v ? (v/1e6).toFixed(1).replace(/[.]0$/,'') + 'M' : '不限'; }
 
@@ -393,8 +484,22 @@ async function poll(){
       (m.p50_ms ? `<span>P50 <b>${m.p50_ms}</b>ms · P95 <b>${m.p95_ms}</b>ms</span>` : '') +
       (cache.enabled ? `<span title="sha256 内容寻址去重">缓存 <b>${cache.size}</b>/${cache.capacity}` +
         (cache.hit_rate != null ? ` · 命中 <b>${(cache.hit_rate*100).toFixed(0)}%</b>` : '') + `</span>` : '');
+    lastOk = Date.now();
   }catch(e){
-    $('#statusBar').innerHTML = '<span class="dot off"></span>无法连接服务';
+    // 一次轮询失败不该把状态整个抹掉 —— 服务通常还好好的，
+    // 只是这一次请求超时/被挤掉了。保留上次数据，角落里提示一下。
+    const ago = lastOk ? Math.round((Date.now()-lastOk)/1000) : null;
+    const note = lastOk
+      ? `<span style="color:var(--warn)" title="${String(e).slice(0,200)}">状态 ${ago}s 未刷新</span>`
+      : `<span style="color:var(--err)" title="${String(e).slice(0,200)}">连接服务失败，点这里看原因</span>`;
+    const bar = $('#statusBar');
+    const old = bar.querySelector('.stale');
+    if(old) old.remove();
+    const span = document.createElement('span');
+    span.className = 'stale';
+    span.innerHTML = note;
+    if(!lastOk) bar.innerHTML = '';
+    bar.appendChild(span);
   }
 }
 poll(); setInterval(poll, 4000);

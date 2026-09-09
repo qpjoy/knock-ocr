@@ -48,6 +48,12 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.35}"     # vLLM 占这张卡的显存比例，�
 # API 进程数默认按 CPU 配额推：配额 / 单次推理线程数
 UVICORN_WORKERS="${UVICORN_WORKERS:-$(( CPU_LIMIT / OMP_THREADS > 1 ? CPU_LIMIT / OMP_THREADS : 1 ))}"
 CACHE_SIZE="${CACHE_SIZE:-512}"          # 内容寻址缓存条数（sha256 去重）；0=关闭
+CACHE_TTL="${CACHE_TTL:-900}"            # 缓存存活秒数，到点销毁（默认 15 分钟）
+CACHE_MAX_MB="${CACHE_MAX_MB:-128}"      # 缓存总内存上限；缓存只在内存，不落盘
+JOB_WORKERS="${JOB_WORKERS:-4}"          # 异步队列消费线程数
+JOB_QUEUE_MAX="${JOB_QUEUE_MAX:-1000}"   # 队列深度，满了返回 429（明确背压）
+JOB_TTL="${JOB_TTL:-1800}"               # 任务结果保留秒数
+FETCH_ALLOW_HOSTS="${FETCH_ALLOW_HOSTS:-}"  # url 传参的域名白名单，空=不限
                                          # 爬虫重复图多，命中率 30~60%，直接抬高有效吞吐
 PROJECT="${PROJECT:-knock-ocr}"          # 容器/网络/卷名前缀，改它可并存多套
 GPU_ID="${GPU_ID:-2}"                    # 只占用这一张卡（默认避开挂显示器的 GPU3）
@@ -825,9 +831,21 @@ PY2
   dim "  看清差别的重点：金额里的逗号、表格结构、竖排/印章、多栏顺序"
 }
 
+# 服务器上 python3 可能是很老的版本（比如 conda base 里的 3.6），
+# 而 bench.py 用到 f-string 等 3.6+ 语法。优先挑一个够新的解释器。
+pick_python() {
+  local c
+  for c in python3.12 python3.11 python3.10 python3.9 python3.8 python3 python; do
+    have "$c" || continue
+    "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)' 2>/dev/null && {
+      echo "$c"; return 0; }
+  done
+  return 1
+}
+
 cmd_bench() {
-  have python3 || die "需要 python3（只用标准库）"
-  PYTHONIOENCODING=utf-8 python3 scripts/bench.py --url "http://127.0.0.1:$PORT/api/ocr" "$@"
+  local py; py="$(pick_python)" || die "找不到 Python 3.6+（bench 只用标准库）"
+  PYTHONIOENCODING=utf-8 "$py" scripts/bench.py --url "http://127.0.0.1:$PORT/api/ocr" "$@"
 }
 
 cmd_disk() {

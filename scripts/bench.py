@@ -6,8 +6,6 @@
 
 输出 QPS / P50 / P95 / P99 与错误分布，用来确定后续 worker 数与 batch 规模。
 """
-from __future__ import annotations
-
 import argparse
 import mimetypes
 import statistics
@@ -20,7 +18,7 @@ import uuid
 from pathlib import Path
 
 
-def build_body(path: Path) -> tuple[bytes, str]:
+def build_body(path):
     boundary = "----knockocr" + uuid.uuid4().hex
     ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     head = (
@@ -32,7 +30,7 @@ def build_body(path: Path) -> tuple[bytes, str]:
     return head + path.read_bytes() + tail, f"multipart/form-data; boundary={boundary}"
 
 
-def main() -> int:
+def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
     ap.add_argument("--file", default=".deploy/sample.png",
@@ -50,8 +48,8 @@ def main() -> int:
     body, ctype = build_body(path)
     url = a.url + ("&" if "?" in a.url else "?") + "include_json=false"
 
-    lat: list[float] = []
-    errs: dict[str, int] = {}
+    lat = []
+    errs = {}
     lock = threading.Lock()
     counter = iter(range(a.requests))
 
