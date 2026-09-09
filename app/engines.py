@@ -54,9 +54,15 @@ class FastEngine(OcrEngine):
         self.intra = int(os.environ.get("OCR_ORT_INTRA_THREADS")
                          or os.environ.get("OMP_NUM_THREADS") or 4)
         self.inter = int(os.environ.get("OCR_ORT_INTER_THREADS") or 1)
-        # ONNX Runtime 的 CUDA EP。注意官方 onnxruntime-gpu 包可能不含 sm_120 kernel，
-        # 那种情况下会「静默回落 CPU」而不报错 —— 开了之后务必对比耗时确认真的更快。
-        self.use_cuda = os.environ.get("OCR_FAST_CUDA", "").strip().lower() in ("1", "true", "yes")
+        # ONNX Runtime 的 CUDA EP。fast-gpu 档默认就开，其余档默认关。
+        # 注意 ONNX Runtime 在 kernel 架构不匹配时会「静默回落 CPU」而不报错，
+        # 所以这里只记「请求了什么」，「实际跑在什么上」由 build() 事后回填。
+        _tier = os.environ.get("OCR_TIER", "").strip().lower()
+        _cuda = os.environ.get("OCR_FAST_CUDA", "").strip().lower()
+        if _cuda:
+            self.use_cuda = _cuda in ("1", "true", "yes")
+        else:
+            self.use_cuda = _tier == "fast-gpu"
         self.applied: dict = {}
 
     def build(self):
@@ -85,6 +91,7 @@ class FastEngine(OcrEngine):
             try:
                 eng = RapidOCR(params=params)
                 self.applied = dict(params)
+                self.applied["providers"] = _ort_providers(eng)
                 return eng
             except TypeError:
                 self.applied = {"note": "本版本 RapidOCR 不接受 params，退回默认配置"}
@@ -120,8 +127,14 @@ class FastEngine(OcrEngine):
         return md, [page], 1
 
     def describe(self) -> dict:
+        # device 报「实际」而不是「请求」—— 老版本这里直接回显环境变量，
+        # ONNX Runtime 静默回落 CPU 时界面照样显示 cuda，把人骗得很惨。
+        provs = self.applied.get("providers") or {}
+        on_cuda = any("CUDAExecutionProvider" in v for v in provs.values())
         return {**super().describe(), "runtime": "onnxruntime",
-                "device": "cuda" if self.use_cuda else "cpu",
+                "device": "cuda" if on_cuda else "cpu",
+                "device_requested": "cuda" if self.use_cuda else "cpu",
+                "providers": provs,
                 "intra_op_num_threads": self.intra,
                 "inter_op_num_threads": self.inter,
                 "applied": self.applied}
@@ -131,6 +144,34 @@ def _seq(v):
     """安全转 list —— rapidocr 3.x 返回 numpy 数组，直接 `or []` 会触发
     「truth value of an array is ambiguous」，所以只判 None 不判真值。"""
     return [] if v is None else list(v)
+
+
+def _ort_providers(eng) -> dict:
+    """挖出 det/rec/cls 三个子模型真实使用的 ExecutionProvider。
+
+    这是判断 GPU 到底有没有生效的唯一可信依据：环境变量只说明「请求了什么」，
+    而 ONNX Runtime 在 kernel 架构不匹配时会悄悄把 CUDA EP 换成 CPU，不报错、
+    不影响启动，只是慢。rapidocr 各版本把 session 藏的位置不一样，逐个试；
+    全都取不到就返回空 dict，让 describe() 保守地报 cpu。
+    """
+    out: dict = {}
+    for attr in ("text_det", "text_rec", "text_cls"):
+        obj = getattr(eng, attr, None)
+        if obj is None:
+            continue
+        for chain in ("session.session", "session", "_session", "model.session"):
+            cur = obj
+            for part in chain.split("."):
+                cur = getattr(cur, part, None)
+                if cur is None:
+                    break
+            if cur is not None and hasattr(cur, "get_providers"):
+                try:
+                    out[attr] = list(cur.get_providers())
+                except Exception:
+                    pass
+                break
+    return out
 
 
 def _rapid_items(out) -> list[dict]:
@@ -281,13 +322,18 @@ def normalize_v1(url: str) -> str:
 
 
 def build_engines(tuning: dict) -> dict:
-    """按 OCR_TIER 决定装哪些引擎，返回 {name: engine}。"""
+    """按 OCR_TIER 决定装哪些引擎，返回 {name: engine}。
+
+    fast 和 fast-gpu 装的是同一个引擎，只是推理运行时不同（onnxruntime /
+    onnxruntime-gpu），所以引擎名对外都叫 fast —— 调用方的 ?engine=fast 不用改。
+    """
     tier = os.environ.get("OCR_TIER", "quality").strip().lower()
-    if tier not in ("fast", "quality", "full"):
-        raise ValueError("OCR_TIER 只能是 fast | quality | full，收到 %r" % tier)
+    if tier not in ("fast", "fast-gpu", "quality", "full"):
+        raise ValueError(
+            "OCR_TIER 只能是 fast | fast-gpu | quality | full，收到 %r" % tier)
 
     engines: dict = {}
-    if tier in ("fast", "full"):
+    if tier in ("fast", "fast-gpu", "full"):
         engines["fast"] = FastEngine()
     if tier in ("quality", "full"):
         engines["quality"] = VLEngine(

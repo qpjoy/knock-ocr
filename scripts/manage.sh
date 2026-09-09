@@ -14,12 +14,20 @@ export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*' 
 
 # ---------------------------------------------------------------- 配置
-TIER="${TIER:-full}"                     # 部署档：fast | quality | full
-                                         #   fast    只装 RapidOCR/PP-OCRv6，镜像 <1GB，不要 GPU
-                                         #   quality 只装 PaddleOCR-VL + vLLM
-                                         #   full    两个都装，接口用 ?engine= 选
+TIER="${TIER:-fast-gpu}"                 # 部署档：fast | fast-gpu | quality | full
+                                         #   fast     RapidOCR/PP-OCRv6 走 CPU，镜像 <1GB，不要 GPU
+                                         #   fast-gpu 同一套模型走 onnxruntime CUDA EP，实测快 2.82×
+                                         #            （单图 680ms -> 241ms，同 32 核配额同 intra_op）
+                                         #            代价是镜像 ~4GB（CUDA+cuDNN 运行时）。默认档。
+                                         #   quality  只装 PaddleOCR-VL + vLLM
+                                         #   full     fast(CPU) + quality 都装，接口用 ?engine= 选
 DEFAULT_ENGINE="${DEFAULT_ENGINE:-}"     # full 档下 /api/ocr 不带 engine 时走哪个，默认 fast
-WORKERS_FAST="${WORKERS_FAST:-8}"        # 快通道每进程的流水线数
+# 快通道每进程的流水线数。CPU 档和 GPU 档的含义完全不同：
+#   fast     一条流水线 = 一份 CPU 线程预算，多开才能把核吃满
+#   fast-gpu 一条流水线 = 三个常驻的 CUDA session（det/rec/cls），每个都会
+#            自己预留显存 arena。按 CPU 档的 8 条 × 8 进程开下去就是 192 个
+#            CUDA session，32GB 显存直接吃干。显卡本来就串行，够喂饱即可。
+if [ "$TIER" = "fast-gpu" ]; then WORKERS_FAST="${WORKERS_FAST:-1}"; else WORKERS_FAST="${WORKERS_FAST:-8}"; fi
 # 单次 ONNX/Paddle 推理会吃满 CPU，靠并发请求提不了吞吐 ——
 # 必须「每次推理只用少量线程 + 多进程」才能把多核吃满。128 核机器尤其明显。
 OMP_THREADS="${OMP_THREADS:-4}"          # 单次推理的线程数上限
@@ -27,7 +35,10 @@ OMP_THREADS="${OMP_THREADS:-4}"          # 单次推理的线程数上限
 # 核数（比如 128），而 cgroup 配额可能只有 32 —— 线程数超配额几倍，全耗在抢锁上，
 # 实测能慢几十倍。必须显式对齐到 CPU 配额。
 ORT_INTRA="${ORT_INTRA:-$OMP_THREADS}"   # fast 引擎单次推理的 ONNX 线程数
-FAST_CUDA="${FAST_CUDA:-0}"              # =1 让 fast 引擎走 CUDA EP（需 onnxruntime-gpu）
+# fast-gpu 档的整个意义就是走 CUDA，所以默认开，不用额外传 FAST_CUDA=1。
+# 其余档的镜像里是 CPU 版 onnxruntime，开了也没用，默认关。
+# 想在 fast-gpu 档强行退回 CPU 对比：FAST_CUDA=0 bash scripts/manage.sh deploy
+if [ "$TIER" = "fast-gpu" ]; then FAST_CUDA="${FAST_CUDA:-1}"; else FAST_CUDA="${FAST_CUDA:-0}"; fi
 
 # ---- 资源占用上限：这台机器还跑着别的服务，默认只吃一小部分 ----
 # 都可以覆盖。想吃满就传 CPU_LIMIT=0 MEM_LIMIT=0（不推荐）。
@@ -43,10 +54,19 @@ CPUSET="${CPUSET:-}"
 # 内存和 CPU 不同：超限是直接 OOM Kill，不是限速；而且已分配的不会自动归还。
 # 所以要按「实际峰值 + 余量」给，不能按机器比例拍 —— 给太小会被杀。
 # 实测量级：fast 每 worker 几百 MB；quality 侧 vLLM 加载期host 内存会冲高。
-if [ "$TIER" = "fast" ]; then MEM_LIMIT="${MEM_LIMIT:-16g}"; else MEM_LIMIT="${MEM_LIMIT:-48g}"; fi
+case "$TIER" in
+  fast|fast-gpu) MEM_LIMIT="${MEM_LIMIT:-16g}" ;;   # 权重都在显存/镜像里，host 内存要得不多
+  *)             MEM_LIMIT="${MEM_LIMIT:-48g}" ;;
+esac
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.35}"     # vLLM 占这张卡的显存比例，剩下留给别人
 # API 进程数默认按 CPU 配额推：配额 / 单次推理线程数
-UVICORN_WORKERS="${UVICORN_WORKERS:-$(( CPU_LIMIT / OMP_THREADS > 1 ? CPU_LIMIT / OMP_THREADS : 1 ))}"
+if [ "$TIER" = "fast-gpu" ]; then
+  # 推理搬到显卡后 CPU 侧只剩前后处理，进程数不必再按核数推 ——
+  # 开多了只是多占显存。4 个足够喂饱一张卡，压测后再按实测调。
+  UVICORN_WORKERS="${UVICORN_WORKERS:-4}"
+else
+  UVICORN_WORKERS="${UVICORN_WORKERS:-$(( CPU_LIMIT / OMP_THREADS > 1 ? CPU_LIMIT / OMP_THREADS : 1 ))}"
+fi
 CACHE_SIZE="${CACHE_SIZE:-512}"          # 内容寻址缓存条数（sha256 去重）；0=关闭
 CACHE_TTL="${CACHE_TTL:-900}"            # 缓存存活秒数，到点销毁（默认 15 分钟）
 CACHE_MAX_MB="${CACHE_MAX_MB:-128}"      # 缓存总内存上限；缓存只在内存，不落盘
@@ -91,11 +111,15 @@ BASE_IMAGE="${BASE_IMAGE:-$REGISTRY/paddleocr-vl:latest-nvidia-gpu}"
 API_IMAGE="${API_IMAGE:-$PROJECT/api:$TIER}"
 case "$TIER" in
   fast)          API_DOCKERFILE="docker/fast.Dockerfile" ;;
+  fast-gpu)      API_DOCKERFILE="docker/fast-gpu.Dockerfile" ;;
   quality|full)  API_DOCKERFILE="docker/api.Dockerfile" ;;
-  *) echo "TIER 只能是 fast | quality | full，收到 $TIER" >&2; exit 1 ;;
+  *) echo "TIER 只能是 fast | fast-gpu | quality | full，收到 $TIER" >&2; exit 1 ;;
 esac
-# fast 档完全不碰 GPU 和官方大镜像
-uses_vllm() { [ "$TIER" != "fast" ]; }
+# 两个维度是独立的，别混用：
+#   uses_vllm  要不要起 vLLM 容器、拉 20~30GB 官方镜像、挂模型缓存卷
+#   needs_gpu  容器要不要 --gpus（fast-gpu 要卡但不要 vLLM）
+uses_vllm() { case "$TIER" in quality|full) return 0 ;; *) return 1 ;; esac; }
+needs_gpu() { [ "$TIER" != "fast" ]; }
 
 NET="${PROJECT}-net"
 C_VLLM="${PROJECT}-vllm"
@@ -232,9 +256,10 @@ cmd_preflight() {
   docker info >/dev/null 2>&1 || die "docker 守护进程不可用（当前用户可能不在 docker 组）。"
   ok "docker 可用"
 
-  if ! uses_vllm; then
+  if ! needs_gpu; then
     ok "档位 $TIER：纯 CPU，不需要 GPU，也不拉 20~30GB 官方镜像"
   else
+  uses_vllm || ok "档位 $TIER：要一张卡跑 ONNX CUDA EP，但不起 vLLM、不拉官方大镜像"
   have nvidia-smi || die "未找到 nvidia-smi"
   local ngpu; ngpu="$(nvidia-smi -L | wc -l | tr -d ' ')"
   nvidia-smi -i "$GPU_ID" >/dev/null 2>&1 || die "GPU $GPU_ID 不存在（本机共 $ngpu 张卡，编号 0..$((ngpu-1))）"
@@ -336,6 +361,58 @@ cmd_preflight() {
 #   2) Paddle 侧能否用这张卡 —— 只影响版面分析放 CPU 还是 GPU，降级不影响精度
 cmd_gpucheck() {
   mkdir -p "$STATE"
+
+  # fast / fast-gpu 档不碰 PyTorch 和 Paddle，下面那两项探测对它们没有意义，
+  # 而且会去拉 20~30GB 的官方镜像。换成真正相关的那一项：ONNX Runtime 的 CUDA EP
+  # 在这张卡上到底立不立得住。
+  if ! uses_vllm; then
+    rule
+    if ! needs_gpu; then
+      ok "档位 $TIER：纯 CPU，无需 GPU 自检"
+      rule; return 0
+    fi
+    say "fast-gpu 自检：ONNX Runtime 能不能真的在 GPU $GPU_ID 上跑"
+    if ! docker image inspect "$API_IMAGE" >/dev/null 2>&1; then
+      warn "镜像 $API_IMAGE 还没构建，先跑一次 deploy"
+      rule; return 1
+    fi
+    local ort_out ort_rc=0
+    ort_out="$(timeout -k 10 "$PROBE_TIMEOUT" docker run --rm --gpus "device=$GPU_ID" \
+      -e OCR_TIER=fast-gpu -e OCR_FAST_CUDA=1 "$API_IMAGE" python -c '
+import sys, time
+sys.path.insert(0, "/app")
+from PIL import Image, ImageDraw
+img = Image.new("RGB", (360, 90), "white")
+ImageDraw.Draw(img).text((12, 34), "gpu probe 12345 ABC", fill="black")
+img.save("/tmp/probe.png")
+from engines import FastEngine
+e = FastEngine()
+h = e.build()
+print("providers", e.applied.get("providers"))
+h("/tmp/probe.png")                       # 预热，让 kernel 真的编译/加载
+t = time.perf_counter()
+for _ in range(3):
+    h("/tmp/probe.png")
+print("infer ok %.0f ms" % ((time.perf_counter() - t) / 3 * 1000))
+' 2>&1)" || ort_rc=$?
+    printf '%s\n' "$ort_out" > "$STATE/ort_probe.log"
+    if [ $ort_rc -eq 0 ] && grep -q 'infer ok' <<<"$ort_out" \
+       && grep -q 'CUDAExecutionProvider' <<<"$ort_out"; then
+      ok "ONNX Runtime 真的跑在这张卡上（providers 里保住了 CUDAExecutionProvider）"
+      sed 's/^/      /' <<<"$ort_out" | tail -3
+    elif [ $ort_rc -eq 0 ] && grep -q 'infer ok' <<<"$ort_out"; then
+      warn "推理跑通了，但 providers 里没有 CUDAExecutionProvider —— 已静默回落 CPU"
+      dim "      这正是最容易被忽悠的情况：服务照常起、日志干净，只是白挂了一张卡。"
+      sed 's/^/      /' <<<"$ort_out" | tail -4
+    else
+      warn "fast-gpu 自检未通过"
+      sed 's/^/      /' <<<"$ort_out" | tail -12
+      dim "      完整日志：$STATE/ort_probe.log"
+      dim "      退回 CPU 版：TIER=fast bash scripts/manage.sh deploy"
+    fi
+    rule; return 0
+  fi
+
   rule
   say "1/2  vLLM 侧（PyTorch）—— 硬要求"
   local torch_out torch_rc=0
@@ -493,14 +570,22 @@ start_api() {
     vurl="http://host.docker.internal:$VLLM_PORT"
     extra=(--add-host "host.docker.internal:host-gateway")
   fi
-  # quality/full 档必须挂 GPU：镜像里是 paddlepaddle 的 GPU 版，import paddle 就要
-  # libcuda.so.1，不挂直接 ImportError，跟我们只用 CPU 跑版面分析无关。
-  # 同时 CUDA_VISIBLE_DEVICES="" 让它看不到任何设备 —— 拿到驱动库但不占显存、不碰 sm_120。
-  # fast 档是纯 ONNX 镜像，完全不需要 GPU。
+  # 挂卡的理由按档位完全不同，别把这两种情况合并：
+  #
+  #   quality/full  镜像里是 paddlepaddle 的 GPU 版，import paddle 就要 libcuda.so.1，
+  #                 不挂直接 ImportError。但我们只用 CPU 跑版面分析，所以再加
+  #                 CUDA_VISIBLE_DEVICES="" 让它看得到驱动库、看不到设备 ——
+  #                 不占显存也不碰 paddle 的 sm_120 坑。
+  #   fast-gpu      反过来：就是要用这张卡跑 ONNX 的 CUDA EP，绝不能清空
+  #                 CUDA_VISIBLE_DEVICES，否则 onnxruntime 找不到设备会静默回落 CPU，
+  #                 服务照常起来、日志干干净净，只是白挂了一张卡。
+  #   fast          纯 CPU 镜像，不挂。
   local vols=()
   if uses_vllm; then
     extra+=(--gpus "device=$GPU_ID" -e CUDA_VISIBLE_DEVICES="")
     vols=(-v "$V_MODELS":"$home/.paddlex" -v "$V_CACHE":"$home/.cache")
+  elif needs_gpu; then
+    extra+=(--gpus "device=$GPU_ID")
   fi
   local lim=(); mapfile -t lim < <(limit_args)
   docker run -d --name "$C_API" --network "$NET" "${lim[@]}" \
@@ -1086,10 +1171,12 @@ knock-ocr demo
   BIND=$BIND        只本机访问传 127.0.0.1
   PROXY=                出网代理，如 http://127.0.0.1:7788（下模型权重用）
   HOST_NET=0            =1 让 vLLM 走宿主机网络；代理只监听 127.0.0.1 时必须开
-  TIER=full             部署档 fast|quality|full
-                        fast    只装 PP-OCRv6(ONNX)，镜像 <1GB，不要 GPU
-                        quality 只装 PaddleOCR-VL + vLLM
-                        full    两个都装，调用时 ?engine=fast|quality 自选
+  TIER=fast-gpu         部署档 fast|fast-gpu|quality|full
+                        fast     PP-OCRv6(ONNX) 走 CPU，镜像 <1GB，不要 GPU
+                        fast-gpu 同一套模型走 CUDA EP，实测 2.82×（680->241ms）
+                                 镜像 ~4GB，要一张卡但不起 vLLM。默认档
+                        quality  只装 PaddleOCR-VL + vLLM
+                        full     fast(CPU) + quality，调用时 ?engine= 自选
   DEFAULT_ENGINE=       full 档下不带 engine 参数时走哪个（默认 fast）
   CPU_LIMIT=<核数/4>    CPU 时间片配额。空闲不占，超限只限速，不会挤到别人。0=不限
   MEM_LIMIT=16g|48g     内存硬上限。超限直接 OOM Kill，按峰值+余量给，别抠
@@ -1097,8 +1184,10 @@ knock-ocr demo
   ORT_INTRA=<=OMP_THREADS>  fast 引擎单次推理的 ONNX 线程数。
                         默认 0 会用「容器看到的全部核」，在有 CPU 配额时会
                         严重超配（128 线程抢 32 核），必须对齐到配额
-  FAST_CUDA=0           =1 让 fast 引擎走 CUDA EP（需 onnxruntime-gpu；
-                        官方包可能不含 sm_120，会静默回落 CPU，开完要对比耗时）
+  FAST_CUDA=<按档位>    fast-gpu 档默认 1，其余档默认 0，一般不用手传。
+                        传 0 可在 fast-gpu 档强行退回 CPU 做对比。
+                        是否真的生效看 /api/info 里的 providers，别看 device_requested
+                        —— ONNX Runtime 回落 CPU 时不报错，只是慢
   GPU_MEM_UTIL=0.35     vLLM 占该卡显存的比例，其余留给别人
   UVICORN_WORKERS=      API 进程数，默认按 CPU 配额推算
   CACHE_SIZE=512        sha256 内容寻址缓存条数；0=关闭

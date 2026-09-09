@@ -7,8 +7,10 @@
   GET  /healthz                       就绪探针
   GET  /                              Web 界面
 
-部署档由 OCR_TIER 决定：fast | quality | full。
-fast 档不装 PaddleOCR-VL，镜像 <1GB，也不需要 GPU。
+部署档由 OCR_TIER 决定：fast | fast-gpu | quality | full。
+fast 档不装 PaddleOCR-VL，镜像 <1GB，也不需要 GPU；
+fast-gpu 是同一套模型换 onnxruntime-gpu，要一张卡但同样不起 vLLM。
+两者对外都叫 engine=fast，调用方不用区分。
 
 刻意只依赖运行镜像里已有的包（fastapi / uvicorn / starlette），
 不引入 python-multipart —— 内网构建 pip 可能出不去，多一个依赖就多一个卡点。

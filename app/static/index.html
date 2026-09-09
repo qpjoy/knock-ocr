@@ -465,8 +465,11 @@ async function poll(){
     const eng = (d.engines || {})[ENGINE] || {};
     $('#modelName').textContent =
       '档位 ' + d.tier + ' · ' + (eng.label || ENGINE);
+    // device 取的是 ONNX Runtime 实际用的 provider，不是环境变量回显 ——
+    // 挂了卡但静默回落 CPU 时，这里会老实显示 CPU。
     $('#benchBadge').textContent =
-      ENGINE === 'quality' ? 'OmniDocBench v1.6 · 96.3%' : 'PP-OCRv6 · ONNX';
+      ENGINE === 'quality' ? 'OmniDocBench v1.6 · 96.3%'
+                           : 'PP-OCRv6 · ONNX · ' + (eng.device === 'cuda' ? 'CUDA' : 'CPU');
     if(d.tuning && d.tuning.vl_rec_max_concurrency != null){
       const sc = d.tuning.vl_rec_max_concurrency;
       if(serverConc === null){ serverConc = sc; K.conc.value = sc; }
