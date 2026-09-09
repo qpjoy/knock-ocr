@@ -118,9 +118,9 @@ button.copy{float:right;font-size:11.5px;padding:3px 10px;border:1px solid var(-
 </div>
 
 <div id="drop">
-  <h2>拖入图片或 PDF</h2>
-  <p>也可以点击选择、或直接 Ctrl+V 粘贴截图 · png / jpg / webp / tiff / pdf</p>
-  <input type="file" id="file" hidden accept=".png,.jpg,.jpeg,.bmp,.webp,.tif,.tiff,.pdf">
+  <h2>拖入图片（可多选）</h2>
+  <p>可一次拖多个 · 点击选择 · Ctrl+V 粘贴 · png / jpg / webp / tiff</p>
+  <input type="file" id="file" hidden multiple accept=".png,.jpg,.jpeg,.bmp,.webp,.tif,.tiff,.pdf">
 </div>
 
 <div class="opts">
@@ -283,12 +283,15 @@ curl -X POST 'http://${H}/api/ocr?engine=${E}' -H 'Content-Type: application/jso
 `# 本地文件，最省带宽
 curl -F 'file=@page.png' 'http://${H}/api/ocr?engine=${E}'
 
-# 一次多个
-curl -F 'file=@a.png' -F 'file=@b.png' 'http://${H}/api/ocr?engine=${E}'
+# 一次多个（最多 32 个）—— 批量小需求用这个，一次请求拿全部结果
+curl -F 'file=@a.png' -F 'file=@b.png' -F 'file=@c.png' 'http://${H}/api/ocr?engine=${E}'
+
+# 大批量走异步：多文件也能投队列
+curl -F 'file=@a.png' -F 'file=@b.png' 'http://${H}/api/ocr/async?engine=${E}'
 
 # 不要结构化 JSON（省带宽，只要 markdown）
 curl -F 'file=@a.png' 'http://${H}/api/ocr?engine=${E}&include_json=false'`,
-      note: '也支持裸 body：curl --data-binary @a.png -H "X-Filename: a.png"'
+      note: '多文件一次请求返回 {"count":n,"items":[...]}，单个失败不影响其余。界面也支持一次拖多个。裸 body：curl --data-binary @a.png -H "X-Filename: a.png"'
     },
     b64: {
       code:
@@ -346,8 +349,9 @@ function paintEngines(){
   const pdf = ENGINE === 'quality';
   $('#drop').querySelector('h2').textContent = pdf ? '拖入图片或 PDF' : '拖入图片';
   $('#drop').querySelector('p').textContent =
-    '也可以点击选择、或直接 Ctrl+V 粘贴截图 · png / jpg / webp / tiff' + (pdf ? ' / pdf' : '');
+    '可一次拖多个 · 点击选择 · Ctrl+V 粘贴 · png / jpg / webp / tiff' + (pdf ? ' / pdf' : '');
   $('#file').accept = '.png,.jpg,.jpeg,.bmp,.webp,.tif,.tiff' + (pdf ? ',.pdf' : '');
+  $('#file').multiple = true;
   // 参数面板只对 quality 有意义
   $('#tune').style.display = (ENGINE === 'quality') ? '' : 'none';
   try{ localStorage.setItem('knock-ocr-engine', ENGINE); }catch(_){}
@@ -506,15 +510,121 @@ poll(); setInterval(poll, 4000);
 
 /* ---------- 上传 ---------- */
 drop.onclick = () => fileInput.click();
-fileInput.onchange = e => e.target.files[0] && send(e.target.files[0]);
+fileInput.onchange = e => e.target.files.length && sendMany([...e.target.files]);
 ['dragenter','dragover'].forEach(t => drop.addEventListener(t, e=>{e.preventDefault();drop.classList.add('hot');}));
 ['dragleave','drop'].forEach(t => drop.addEventListener(t, e=>{e.preventDefault();drop.classList.remove('hot');}));
-drop.addEventListener('drop', e => e.dataTransfer.files[0] && send(e.dataTransfer.files[0]));
+drop.addEventListener('drop', e => e.dataTransfer.files.length && sendMany([...e.dataTransfer.files]));
 window.addEventListener('paste', e => {
-  for(const it of e.clipboardData.items){
-    if(it.type.startsWith('image/')){ send(it.getAsFile()); break; }
-  }
+  const imgs = [...e.clipboardData.items]
+    .filter(it => it.type.startsWith('image/')).map(it => it.getAsFile());
+  if(imgs.length) sendMany(imgs);
 });
+
+/* 批量：客户端按并发上限并行发，逐个回填 —— 既有实时进度，
+   也真实压到服务端的流水线池上，看到的耗时就是它的实际表现。
+   （接口本身也支持一次多文件：-F file=@a -F file=@b，那种是一次请求返回全部） */
+const UI_CONCURRENCY = 4;
+let batch = [];
+
+function fmtKB(n){ return (n/1024).toFixed(0) + ' KB'; }
+
+function renderBatch(){
+  const done = batch.filter(x => x.state === 'done').length;
+  const fail = batch.filter(x => x.state === 'failed').length;
+  const rows = batch.map((x, i) => {
+    const cls = x.state === 'failed' ? 'style="color:var(--err)"' : '';
+    const st = {queued:'排队', running:'识别中…', done:'完成', failed:'失败'}[x.state];
+    return `<tr data-i="${i}" ${x.state === 'done' ? 'class="pick"' : ''} ${cls}>
+      <td>${esc(x.file.name || '粘贴的图片')}</td>
+      <td>${fmtKB(x.file.size)}</td>
+      <td>${x.state === 'running' ? '<span class="spin"></span> ' : ''}${st}</td>
+      <td>${x.ms != null ? x.ms + ' ms' : '-'}</td>
+      <td>${x.chars != null ? x.chars : '-'}</td>
+      <td>${x.cached ? '<span style="color:var(--ok)">命中</span>' : ''}</td>
+    </tr>` + (x.err ? `<tr ${cls}><td colspan="6" style="font-size:11.5px">${esc(x.err)}</td></tr>` : '');
+  }).join('');
+
+  $('#pane-render').innerHTML =
+    `<p style="margin:0 0 10px">共 <b>${batch.length}</b> 个 · 完成 <b>${done}</b>` +
+    (fail ? ` · <span style="color:var(--err)">失败 ${fail}</span>` : '') +
+    (done ? ` · 合计 <b>${batch.reduce((s,x)=>s+(x.ms||0),0)}</b> ms` : '') +
+    `<span style="color:var(--dim)"> · 点完成的行看结果</span></p>` +
+    `<table><thead><tr><th>文件</th><th>大小</th><th>状态</th><th>耗时</th><th>字符</th><th>缓存</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>`;
+
+  $('#pane-render').querySelectorAll('tr.pick').forEach(tr => {
+    tr.style.cursor = 'pointer';
+    tr.onclick = () => showOne(batch[+tr.dataset.i]);
+  });
+}
+
+function showOne(x){
+  if(!x || !x.data) return;
+  const d = x.data, tm = d.timings || {};
+  $('#srcText').textContent = d.markdown || '';
+  $('#jsonText').textContent = JSON.stringify(d.result ?? {}, null, 2);
+  $('#meta').innerHTML =
+    `<span>${esc(d.filename || '')}</span>` +
+    `<span>引擎 <b>${d.engine||'-'}</b></span>` +
+    (d.cached ? `<span style="color:var(--ok)"><b>缓存命中</b></span>` : '') +
+    `<span>页数 <b>${d.pages}</b></span>` +
+    `<span>字符 <b>${(d.markdown||'').length}</b></span>` +
+    `<span title="服务端接收请求体的时间">接收 <b>${tm.receive_ms ?? '-'}</b> ms</span>` +
+    `<span title="等待空闲流水线的时间，高说明并发打满了">排队 <b>${tm.queue_ms ?? '-'}</b> ms</span>` +
+    `<span title="真正的识别耗时">推理 <b>${tm.infer_ms ?? '-'}</b> ms</span>` +
+    `<span style="color:var(--dim)">${d.request_id}</span>`;
+  show('source');
+  $('#pane-source').scrollTop = 0;
+}
+
+async function sendMany(files){
+  if(files.length === 1) return send(files[0]);
+  batch = files.map(f => ({file:f, state:'queued', ms:null, chars:null, data:null, err:null}));
+  $('#res').hidden = false;
+  show('render');
+  $('#meta').textContent = '';
+  renderBatch();
+
+  let idx = 0;
+  const t0 = performance.now();
+  async function worker(){
+    while(idx < batch.length){
+      const x = batch[idx++];
+      x.state = 'running'; renderBatch();
+      try{
+        const d = await postOne(x.file);
+        Object.assign(x, {state:'done', data:d, ms:Math.round(d.elapsed_ms),
+                          chars:(d.markdown||'').length, cached:!!d.cached});
+      }catch(e){
+        Object.assign(x, {state:'failed', err:String(e.message || e)});
+      }
+      renderBatch();
+    }
+  }
+  await Promise.all(Array.from({length:Math.min(UI_CONCURRENCY, batch.length)}, worker));
+  const wall = performance.now() - t0;
+  const okN = batch.filter(x => x.state === 'done').length;
+  $('#meta').innerHTML =
+    `<span>批量 <b>${batch.length}</b> 个</span>` +
+    `<span>成功 <b>${okN}</b></span>` +
+    `<span>墙钟 <b>${wall.toFixed(0)}</b> ms</span>` +
+    `<span title="客户端并发 ${UI_CONCURRENCY}">吞吐 <b>${(okN / (wall/1000)).toFixed(2)}</b> 张/秒</span>`;
+  poll();
+}
+
+async function postOne(f){
+  const fd = new FormData(); fd.append('file', f, f.name || 'paste.png');
+  let qs = `?merge_tables=${$('#mergeTables').checked}&include_json=${$('#includeJson').checked}`;
+  if(ENGINE) qs += '&engine=' + ENGINE;
+  if(ENGINE === 'quality') qs += '&' + tuneQuery();
+  const r = await fetch('/api/ocr' + qs, {method:'POST', body:fd});
+  const txt = await r.text();
+  if(!r.ok){
+    let msg = txt; try{ msg = JSON.parse(txt).detail || txt; }catch(_){}
+    throw new Error(String(msg).slice(0, 300));
+  }
+  return JSON.parse(txt);
+}
 
 async function send(f){
   $('#res').hidden = false;
