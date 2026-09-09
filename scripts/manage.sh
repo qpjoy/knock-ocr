@@ -268,7 +268,11 @@ hostpath() {
 gen_sample() {
   local dst="$1" cid rc=0
   mkdir -p "$(dirname "$dst")"
-  cid="$(docker create "$API_IMAGE" python /app/make_sample.py /tmp/sample.png)" || return 1
+  # --entrypoint python 绕开基础镜像的 nvidia 入口脚本。它一看没挂 --gpus 就打一句
+  # 「NVIDIA Driver was not detected」，而这里只是借镜像用 PIL 画张图，本来就不需要卡。
+  # 那句警告在 API 主容器的日志里是有用信号（说明真的漏挂了卡），所以只在这类
+  # 辅助调用里绕开，不去动镜像的 ENTRYPOINT。
+  cid="$(docker create --entrypoint python "$API_IMAGE" /app/make_sample.py /tmp/sample.png)" || return 1
   docker start -a "$cid" || rc=$?
   if [ $rc -ne 0 ]; then docker rm -f "$cid" >/dev/null 2>&1; return 1; fi
   docker cp "$cid:/tmp/sample.png" "$(hostpath "$dst")" >/dev/null || rc=$?
@@ -1157,7 +1161,7 @@ cmd_selftest() {
   rule
   say "0  检查 API 镜像里的解析流水线依赖"
   local dep_out dep_rc=0
-  dep_out="$(docker run --rm "$API_IMAGE" python -c "
+  dep_out="$(docker run --rm --entrypoint python "$API_IMAGE" -c "
 from paddlex.utils.deps import require_extra
 require_extra('ocr')
 print('paddlex[ocr] 依赖齐全')
